@@ -1,0 +1,4297 @@
+---
+title: "Reproducibility of Organ Level Effects"
+author: "Katie Paul Friedman"
+date: "04/07/2023"
+output: 
+ html_document:
+    code_folding: hide
+    collapsed: yes
+    df_print: paged
+    lightbox: no
+    number_sections: yes
+    self_contained: yes
+    thumbnails: no
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, warning=FALSE, message=FALSE, echo=FALSE}
+library(broom)
+library(caret)
+library(cowplot)
+library(data.table)
+library(DescTools)
+library(dplyr)
+library(DT)
+library(ggplot2)
+library(ggpmisc)
+library(gplots)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(httk)
+library(kableExtra)
+library(openxlsx)
+library(plotly)
+library(purrr)
+library(RMySQL)
+library(tidyr)
+library(tcpl)
+library(viridis)
+
+```
+
+```{r, warning=FALSE, eval=FALSE, echo=FALSE}
+
+con <- dbConnect(drv = RMySQL::MySQL(),  user="", password="",host="", database=prod_toxrefdb_2_1) # this is toxrefdb v2.1 released Sept 2022 
+
+```
+
+# Dataset Construction {.tabset .tabset-fade .tabset-pills}
+
+## Data from ToxRefDB version 2.1
+
+* Data from ToxRefDB version 2.1 were obtained and cleaned.
+* Requirements: adults, oral exposure, systemic effects only.
+
+```{r, warning=FALSE, eval=FALSE}
+
+toxrefv2_1 <- dbGetQuery(con, "SELECT 
+                       chemical.chemical_id,
+                       chemical.dsstox_substance_id,
+                       chemical.casrn,
+                       chemical.preferred_name,
+                       study.study_id,
+                       study.processed,
+                       study.study_type, 
+                       study.study_year,
+                       study.study_source,
+                       study.species, 
+                       study.strain_group,
+                       study.admin_route,
+                       study.admin_method,
+                       study.substance_purity,
+                       endpoint.endpoint_category,
+                       endpoint.endpoint_type,
+                       endpoint.endpoint_target,
+                       endpoint.endpoint_id,
+                       tg_effect.life_stage,
+                       tg_effect.tg_effect_id,tg_effect.target_site,
+                       effect.effect_id,
+                       effect.effect_desc,
+                       tg.sex,
+                       tg.generation,
+                       dose.dose_level,
+                       dtg.dose_adjusted,
+                       dtg.dose_adjusted_unit,
+                       dtg_effect.treatment_related,
+                       dtg_effect.critical_effect,
+                       tested_status,
+                       reported_status
+                       FROM 
+                       (((((((((res_toxrefdb.chemical INNER JOIN res_toxrefdb.study ON chemical.chemical_id=study.chemical_id)
+                       LEFT JOIN res_toxrefdb.dose ON dose.study_id=study.study_id)
+                       LEFT JOIN res_toxrefdb.tg ON tg.study_id=study.study_id)
+                       LEFT JOIN res_toxrefdb.dtg ON tg.tg_id=dtg.tg_id AND dose.dose_id=dtg.dose_id)
+                       LEFT JOIN res_toxrefdb.tg_effect ON tg.tg_id=tg_effect.tg_id)
+                       LEFT JOIN res_toxrefdb.dtg_effect ON tg_effect.tg_effect_id=dtg_effect.tg_effect_id AND dtg.dtg_id=dtg_effect.dtg_id)
+                       LEFT JOIN res_toxrefdb.effect ON effect.effect_id=tg_effect.effect_id)
+                       LEFT JOIN res_toxrefdb.endpoint ON endpoint.endpoint_id=effect.endpoint_id)
+                       LEFT JOIN res_toxrefdb.obs ON obs.study_id=study.study_id AND obs.endpoint_id=endpoint.endpoint_id)
+                       WHERE
+                       tg_effect.life_stage='adult';") %>% 
+  data.table() 
+
+
+save(toxrefv2_1, file='./source/prod_toxrefdb_2_1_all_adult.RData')
+
+```
+
+## Clean and understand the data
+
+```{r, warning=FALSE}
+
+load(file='./source/prod_toxrefdb_2_1_all_adult.RData')
+
+```
+
+* How many chemicals and studies did we start with from ToxRefDB v2.1 (all unfiltered results with positives reporting)?
+  + 1087 chemicals 
+  + 5381 studies
+
+```{r, warning=FALSE}
+chem.study <- unique(toxrefv2_1[,c('chemical_id', #db-specific chem id
+                                 'dsstox_substance_id',
+                                 'casrn',
+                                 'preferred_name',
+                                 'study_id',
+                                 'study_type')])
+
+length(unique(chem.study$chemical_id)) #1087 unique chemicals
+length(unique(chem.study$study_id)) #5381 unique studies
+
+```
+
+```{r, warning=FALSE}
+
+chem.study[,study.count := .N, by=list(dsstox_substance_id)]
+hist(chem.study$study.count, main='Unfiltered Frequency of Studies per Chemical', xlab='Study Count per Chemical')
+
+```
+
+* The range of study/chemical was 1-28, median study count/chemical was 7, and 916 chemicals with >1 study (all unfiltered).
+
+```{r, warning=FALSE}
+
+range(chem.study$study.count) #1-28
+median(chem.study$study.count) #7
+length(unique(chem.study[study.count>1]$chemical_id)) #916, but note these numbers are before filtering
+
+```
+
+
+* Requirements on the data include:
+  + "processed" is 1 in ToxRefDB
+  + endpoint category: systemic only
+  + administration route: oral only
+  + these species only: rat, mouse, dog, rabbit
+  + these study types only: SUB = subchronic; CHR = chronic; SAC = subacute
+  
+```{r, warning=FALSE, eval=FALSE}
+# we know that we want to explore repeat dose toxicity alone and its reproducibility
+#unique(toxrefv2$endpoint_target) # there are some reproductive endpoints in here we want to exclute
+#unique(toxrefv2$endpoint_category) #"cholinesterase" "systemic"       "developmental"  "reproductive" 
+
+toxreftbl<-filter(toxrefv2_1,  endpoint_category==c('systemic')) # select only systemic
+
+# introduce some explicit data limitations on admin route (ar), species (sp), study type (st), endpoint category (ec), endpoint target (edpt), lifestage (ls), generation (gn)
+
+ar <- c("Oral", "Oral/Gavage", "Feed")
+sp <- c("mouse", "rat", "dog", "rabbit", "Tif: RAI f (SPF)") 
+st <- c("SUB","CHR","SAC")
+ec <- c('systemic')
+ls <- c('adult')
+gn <- c('F0')
+
+## filter the dataset for preset parameters
+
+tbl<- data.table(toxreftbl) %>% .[processed==1 &
+                                        dose_adjusted > 0 &
+                                        dose_adjusted_unit == 'mg/kg/day' &
+                                        dose_level > 0 &
+                                        admin_route %in% ar &
+                                        study_type %in% st &
+                                        species %in% sp &
+                                        endpoint_category %in% ec &
+                                        life_stage %in% ls &
+                                        generation %in% gn 
+                                        
+] %>%
+  .[ , chem := paste(dsstox_substance_id, preferred_name, sep = "||")] %>%
+  data.table()
+
+## Standarizing meta-data 
+
+tbl[ , strain_group := tolower(strain_group) ]
+tbl[ strain_group %in% c("sprague dawley","sprague-dawley"), strain_group:="sprague_dawley" ]
+tbl[ strain_group %in% c("other", NA), strain_group := species ]
+
+tbl[ study_source %in% c("NTP Technical Report", "NTP Report"), study_source:="ntp"]
+
+tbl[ , admin_method:=tolower(admin_method) ]
+tbl[ admin_method =="[Not Specified]", admin_method := admin_route ] ## All admin_method[Not Specified] ==> default to admin method
+
+tbl[ substance_purity==">95", substance_purity:="95" ]
+tbl[ substance_purity==">99", substance_purity:="99" ]
+
+tbl[ substance_purity=="99.75% gamma isomer of hexachlorocyclohexane", substance_purity:="99.75"]
+tbl[ substance_purity=="72 +/- 3" , substance_purity:="72"]
+tbl[ substance_purity=="96.8 percent" , substance_purity:="96.8"]
+
+#unique(tbl$substance_purity)
+tbl[substance_purity %in% c('Not included in DER',
+                           '[Not Reported]',
+                           'Not reported ',
+                           '[Not reported]',
+                           '[Not Specified]',
+                           'not specified',
+                           'Not reported',
+                           'not reported',
+                           'Not Reported',
+                           '[not reported]'), substance_purity := 'NA']
+
+
+tbl[substance_purity=='89.9; 88.2; 93.1', substance_purity := mean(89.9,88.2,93.1)]
+tbl[substance_purity=='40.2 percent (cis) and 38.3 percent (trans)', substance_purity := sum(40.2,38.3)]
+tbl[substance_purity=='98.2; 98.9', substance_purity := mean(98.2,98.9)]
+tbl[substance_purity=='84.3; 93.7', substance_purity := mean(84.3,93.7)]
+tbl[substance_purity=='97.3-98.1', substance_purity := mean(97.3,98.1)]
+tbl[substance_purity=='97.3%', substance_purity := 97.3]
+tbl[substance_purity=='0.969', substance_purity := 96.9]
+tbl[substance_purity=='0.77', substance_purity := 77]
+tbl[substance_purity=='0.48', substance_purity := 48]
+tbl[substance_purity=='>98', substance_purity := 98]
+tbl[substance_purity=='92.9%', substance_purity := 92.9]
+tbl[substance_purity=='101.1 and 101.2', substance_purity := mean(101.1, 101.2)]
+tbl[substance_purity=='0.97', substance_purity:= 97]
+tbl[substance_purity=='0.91', substance_purity:= 91]
+tbl[substance_purity=='98-100', substance_purity:= mean(98,100)]
+
+tbl[, substance_purity:=as.numeric(substance_purity) ] # still some NAs but hopefully resolved most, can doublecheck
+#na.omit(tbl$substance_purity) #didnt remove remaining NA
+tbl[ substance_purity>100, substance_purity:=100]
+
+# drop any chemical that fails to have study_count > 1 because these will not have replicate studies by our definition
+tbl[,study_count := uniqueN(study_id), by=dsstox_substance_id]
+tbl <- tbl[study_count > 1]
+
+save(toxrefv2_1, tbl, file='./source/prod_toxrefdb_2_1_adult_dataset.RData')
+```
+
+```{r, warning=FALSE}
+load('./source/prod_toxrefdb_2_1_adult_dataset.RData')
+
+```
+
+* These filters leave 525 substances with n>1 studies per chemical.
+* Total of 2170 unique studies in this dataset.
+
+```{r, warning=FALSE}
+
+#length(unique(tbl$dsstox_substance_id)) #525 substances
+#length(unique(tbl$study_id)) #2170
+
+```
+```{r, warning=FALSE}
+
+chem.study2 <- unique(tbl[,c('chemical_id', #db-specific chem id
+                                 'dsstox_substance_id',
+                                 'casrn',
+                                 'preferred_name',
+                                 'study_id',
+                                 'study_type')])
+
+#length(unique(chem.study2$chemical_id)) #525 unique chemicals
+#length(unique(chem.study2$study_id)) #2170 unique studies
+
+chem.study2[,study.count := .N, by=list(dsstox_substance_id)]
+
+range(chem.study2$study.count) #2-19
+median(chem.study2$study.count) #5
+length(unique(chem.study2[study.count>1]$chemical_id)) #525
+
+```
+
+```{r, warning=FALSE}
+
+hist(chem.study2$study.count, main='Filtered Frequency of Studies per Chemical', xlab='Study Count per Chemical')
+
+
+```
+
+## Endpoints for analysis
+
+* Which organ-level endpoint targets have enough data to consider variance?
+
+```{r, warning=FALSE}
+endpoint.frequency <- tbl[treatment_related==1,list(
+  freq = .N
+), by = list(endpoint_category, endpoint_type, endpoint_target, effect_desc, effect_id)] %>%
+  data.table()
+
+endpoint.frequency[,freq.group.endpoint.target := sum(freq), by=endpoint_target]
+endpoint.frequency <- endpoint.frequency[order(-freq.group.endpoint.target)]
+
+# clarification of endpoint_target based on endpoint_type
+endpoint.frequency[endpoint_target=='volume', endpoint_target := 'urinalysis_volume']
+endpoint.frequency[endpoint_type=='clinical chemistry' & endpoint_target=='protein', 
+                   endpoint_target := 'clinical chemistry, protein']
+endpoint.frequency[endpoint_type=='urinalysis' & endpoint_target=='protein', 
+                   endpoint_target := 'urinalysis, protein']
+
+
+```
+
+
+
+```{r, warning=FALSE, fig.height=12, fig.width=15, dpi=450}
+
+# figure of the frequency; consider annotating further to demonstrate selection
+hist.freq <- ggplot(data=unique(endpoint.frequency[freq.group.endpoint.target>200, 
+                                                   c('endpoint_target','freq.group.endpoint.target')]), 
+                    aes(x=reorder(endpoint_target, -freq.group.endpoint.target), y=freq.group.endpoint.target)) +
+  geom_bar(stat='identity')+
+  theme_bw()+
+  theme(panel.border = element_blank(), 
+        #panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(face='bold', size=14),
+        axis.title.y = element_text(face='bold', size=14),
+        axis.text.x = element_text(size=10, angle=90, hjust=0.95, vjust=0.2),
+        axis.text.y = element_text(size=12))+
+  scale_y_continuous(breaks=seq(0,15000,2500))+
+  xlab('Endpoint Target')+
+  ylab('Frequency')+
+  ggtitle('Frequency of Treatment-Related Findings at Endpoint Targets')
+
+hist.freq
+```
+```{r, warning=F, eval=F, echo=F}
+# export figure
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig_freq_endpt_target_group_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=3000, height=3000, res=480)
+hist.freq
+dev.off()
+
+```
+
+
+
+* Which organ-level endpoint targets have enough data to consider variance, and how do they appear at a study_type level?
+
+```{r, warning=FALSE}
+endpoint.frequency.st <- tbl[treatment_related==1,list(
+  freq = .N
+), by = list(endpoint_category, endpoint_type, endpoint_target, effect_desc, effect_id, study_type)] %>%
+  data.table()
+
+endpoint.frequency.st[,freq.group.endpoint.target.st := sum(freq), by=list(endpoint_target, study_type)]
+endpoint.frequency.st <- endpoint.frequency.st[order(-freq.group.endpoint.target.st)]
+
+# clarification of endpoint_target based on endpoint_type
+endpoint.frequency.st[endpoint_target=='volume', endpoint_target := 'urinalysis_volume']
+endpoint.frequency.st[endpoint_type=='clinical chemistry' & endpoint_target=='protein', 
+                   endpoint_target := 'clinical chemistry, protein']
+endpoint.frequency.st[endpoint_type=='urinalysis' & endpoint_target=='protein', 
+                   endpoint_target := 'urinalysis, protein']
+
+
+```
+
+
+
+```{r, warning=FALSE, fig.height=15, fig.width=9, dpi=450}
+
+endpoint.frequency.st$study_type = factor(endpoint.frequency.st$study_type, levels=c('CHR','SUB','SAC'))
+
+# figure of the frequency; consider annotating further to demonstrate selection
+hist.freq2 <- ggplot(data=unique(endpoint.frequency.st[freq.group.endpoint.target.st>200, 
+                                                   c('endpoint_target','freq.group.endpoint.target.st', 'study_type')]), 
+                    aes(x=reorder(endpoint_target, -freq.group.endpoint.target.st), y=freq.group.endpoint.target.st)) +
+  geom_bar(stat='identity')+
+  theme_bw()+
+  theme(panel.border = element_blank(), 
+        #panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.line = element_line(colour = "black"),
+        axis.title.x = element_text(face='bold', size=14),
+        axis.title.y = element_text(face='bold', size=14),
+        axis.text.x = element_text(size=10, angle=90, hjust=0.95, vjust=0.2),
+        axis.text.y = element_text(size=12))+
+  scale_y_continuous(breaks=seq(0,15000,2500))+
+  xlab('Endpoint Target')+
+  ylab('Frequency')+
+  #ggtitle('Frequency of Treatment-Related Findings at Endpoint Targets, by Study Type')+
+  facet_wrap(.~study_type, nrow=3, ncol=1)+
+  theme(strip.background = element_rect(color='black', fill='white', size=1),
+        strip.text = element_text(size=12, color='black', face='bold'))
+
+hist.freq2
+```
+
+```{r, warning=FALSE, eval=F, echo=F}
+
+# export figure
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig_Supp1_freq_endpt_target_group_x_study_type_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=3000, height=6000, res=480)
+hist.freq2
+dev.off()
+```
+
+
+
+## Create full positive and negative dataset by endpoint_target
+
+* Given the top organ-level findings in ToxRefDB, the following six organs seem to have the most positive findings:
+  + liver
+  + kidney
+  + spleen
+  + adrenal
+  + stomach
+  + thyroid
+  
+* In the following chunks, endpoint target group is defined.
+* Endpoint target group expands upon the endpoint target (which in this case are organs) by adding clinical measures that are connected to the tissue (see below).
+
+* For endpoint_target_group, we include liver-relevant clinical chemistry with liver.
+
+```{r, warning=FALSE}
+
+# create endpoint target groups to contain relevant effects to the tissues
+
+tbl[,endpoint_target_group := endpoint_target] # by creating separate grouping, we can turn on or off
+
+## liver grouping
+
+globulins <- tbl[grep('globul',endpoint_target), endpoint_target]
+tbl[endpoint_type=='clinical chemistry' & endpoint_target %in% c('alkaline phosphatase (alp/alk)',
+                                                                 'alanine aminotransferase (alt/sgpt)',
+                                                                 'aspartate aminotransferase (ast/sgot)',
+                                                                 'bilirubin',
+                                                                 'gamma glutamyl transferase (ggt)',
+                                                                 'gamma glutamyl transpeptides (gtp)',
+                                                                 globulins),
+    endpoint_target_group := 'liver']
+```
+
+* For endpoint_target_group=kidney, we include kidney-relevant clinical chemistry with kidney.
+
+```{r, warning=FALSE}
+
+tbl[endpoint_type=='clinical chemistry' 
+    & endpoint_target %in% c('urea nitrogen')|endpoint_type=='urinalysis' 
+    & endpoint_target %in% c('urinalysis, protein'),
+    endpoint_target_group := 'kidney']
+```
+
+* For endpoint_target_group=thyroid, we include thyroid hormone measures from clinical chemistry with thyroid.
+
+```{r, warning=FALSE}
+## thyroid grouping for review
+
+tbl[endpoint_type=='clinical chemistry' & endpoint_target %in% c('thyroxine (t4)',
+                                                                 'triiodothyronine (t3)',
+                                                                 'thyroid stimulating hormone (thyrotropin) (tsh)'),
+    endpoint_target_group := 'thyroid gland']
+
+```
+
+## Dataset for variance estimation by organ
+
+* This dataset is positives-only reporting and includes no inferences about negatives.
+* Filter the refined dataset for the top 6 organ-level endpoint_target values present.
+* kidney, liver, stomach, thyroid gland, spleen, adrenal gland
+
+```{r, warning=FALSE}
+tbl <- tbl[endpoint_target_group %in% c('adrenal gland',
+                                        'liver',
+                                        'kidney',
+                                        'spleen',
+                                        'stomach',
+                                        'thyroid gland')]
+
+```
+
+```{r, warning=FALSE, eval=FALSE}
+#unique(tbl$endpoint_target_group)
+save(tbl, file='./source/endpoints_data.RData')
+
+```
+
+* Need to understand the types of endpoints
+```{r, warning=FALSE, fig.width=12, fig.height=9}
+
+endpt.type.all <- ggplot(data=tbl)+
+  geom_bar(aes(x=endpoint_type, fill=study_type))+
+  scale_fill_viridis(discrete=TRUE)+
+  facet_wrap(~endpoint_target_group, scales='free')+
+  theme_bw()+
+  theme(strip.background = element_rect(color='black', fill='white', size=1),
+        strip.text = element_text(size=12, color='black', face='bold'),
+        axis.text.x = element_text(size=12, angle=45, hjust=1),
+        axis.text.y=element_text(size=12),
+        axis.title = element_text(size=14))
+
+plot_grid(endpt.type.all)
+  
+```
+
+```{r, warning=F, eval=F, echo=F}
+# export figure
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig_Supp2 endpt_type_all_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=6000, height=6000, res=600)
+endpt.type.all
+dev.off()
+```
+
+
+```{r, warning=FALSE}
+
+load(file='./source/endpoints_data.RData')
+
+```
+
+## Dataset for reproducibility of effects by organ
+
+* Need to capture the studies that measured these organs but are negative.
+* Add these to the positive findings.
+* 35 endpoints included for the 6 endpoint_target_groups created.
+
+```{r, warning=FALSE}
+
+# what are the endpoints to check for negative findings?
+endpoints <- unique(tbl[endpoint_target_group %in% c('adrenal gland',
+                                        'liver',
+                                        'kidney',
+                                        'spleen',
+                                        'stomach',
+                                        'thyroid gland'),
+           c('endpoint_id',
+             'endpoint_category',
+             'endpoint_type',
+             'effect_id',
+             'effect_desc',
+             'endpoint_target_group')])
+endpoint_ids <- unique(endpoints$endpoint_id) #35
+
+```
+
+* Retrieve the studies where 35 endpoints were tested.
+* SUB, SAC, and CHR guideline studies from the OPPTS 870 Series require examination of these six organs.
+
+```{r, warning=FALSE, eval=FALSE}
+#cat(paste0(endpoint_ids, ",")) # use helper function to get the endpoint_ids formatted for SQL query
+
+endpoints.tested <- dbGetQuery(con, "SELECT DISTINCT
+                           chemical.dsstox_substance_id,                   
+                           chemical.casrn,
+                           chemical.preferred_name,
+                           study.study_id,
+                           study.species, study.admin_route,
+                           study.study_type, study.processed,
+                           obs.tested_status, obs.reported_status,
+                           endpoint.*
+                           FROM
+                           ((((prod_toxrefdb_2_1.study INNER JOIN prod_toxrefdb_2_1.chemical ON chemical.chemical_id=study.chemical_id)
+                           INNER JOIN prod_toxrefdb_2_1.obs ON obs.study_id=study.study_id)
+                           INNER JOIN prod_toxrefdb_2_1.guideline_profile ON guideline_profile.guideline_id=study.guideline_id)
+                           INNER JOIN prod_toxrefdb_2_1.endpoint ON endpoint.endpoint_id=guideline_profile.endpoint_id)
+                           WHERE
+                           tested_status=1 AND endpoint.endpoint_id IN (348, 300, 220, 231, 381, 95, 140, 267, 109, 
+                               222, 268, 269, 137, 361, 54, 334, 100, 2, 82, 364, 395, 246, 313, 271, 87, 187, 10,
+                               143, 265, 376, 322, 119, 281, 315, 11);") %>% data.table()
+
+
+```
+
+* For the studies with these endpoints tested, we need to:
+  + Filter the data for our requirements (oral admin_route, study_type, endpoint_category, and species)
+  + Apply the endpoint_target_group definitions that we used previously in the positives dataset.
+  + processed is 1 in ToxRefDB
+
+```{r, warning=FALSE, eval=FALSE}
+endpoints.tested <- endpoints.tested[processed==1 &
+                                       admin_route %in% c("Oral", "Oral/Gavage", "Feed") &
+                                       study_type %in% c("SUB","CHR","SAC") &
+                                       endpoint_category %in% c('systemic') &
+                                       species %in% c('dog','mouse','rat') # only repeat dose studies with these species
+                                       ]
+
+endpoints.tested[,chem.study.endpt := paste0(dsstox_substance_id, '_',study_id,'_',endpoint_id)] # this is how we link endpoints.tested to the positive data
+
+# need to apply endpoint target grouping
+
+endpoints.tested[,endpoint_target_group := endpoint_target] # by creating separate grouping, we can turn on or off
+
+## liver grouping
+
+globulins <- tbl[grep('globul',endpoint_target), endpoint_target]
+endpoints.tested[endpoint_type=='clinical chemistry' & endpoint_target %in% c('alkaline phosphatase (alp/alk)',
+                                                                 'alanine aminotransferase (alt/sgpt)',
+                                                                 'aspartate aminotransferase (ast/sgot)',
+                                                                 'bilirubin',
+                                                                 'gamma glutamyl transferase (ggt)',
+                                                                 'gamma glutamyl transpeptides (gtp)',
+                                                                 'globulins'),
+    endpoint_target_group := 'liver']
+
+## kidney grouping
+
+endpoints.tested[endpoint_type=='clinical chemistry' 
+    & endpoint_target %in% c('urea nitrogen')|endpoint_type=='urinalysis' 
+    & endpoint_target %in% c('urinalysis, protein'),
+    endpoint_target_group := 'kidney']
+
+## thyroid grouping
+
+endpoints.tested[endpoint_type=='clinical chemistry' & endpoint_target %in% c('thyroxine (t4)',
+                                                                 'triiodothyronine (t3)',
+                                                                 'thyroid stimulating hormone (thyrotropin) (tsh)'),
+    endpoint_target_group := 'thyroid gland']
+
+
+
+```
+
+
+* Here we create the positive endpoints table (from the dataset derived previously from positive reporting).
+
+```{r, warning=FALSE, eval=FALSE}
+
+endpoints.pos <- unique(tbl[endpoint_target_group %in% c('adrenal gland',
+                                                     'liver',
+                                                     'kidney',
+                                                     'spleen',
+                                                     'stomach',
+                                                     'thyroid gland') & treatment_related==1])
+
+# study_id 3362 is not included in endpoints.tested, and is omitted here.
+
+endpoints.pos <- endpoints.pos[!study_id==3362]
+
+```
+
+* And then we define the the number of studies positive by:
+  + chemical as dsstox_substance_id and endpoint_target_group
+  + chemical as dsstox_substance_id and endpoint_target_group and study_type
+  + chemical as dsstox_substance_id and endpoint_target_group and species
+
+```{r, warning=FALSE, eval=FALSE}
+
+# chemical and endpoint group defines replicate
+endpoints.pos[, studies.pos := paste0(unique(study_id),collapse=","), by= list(dsstox_substance_id, endpoint_target_group)]
+endpoints.pos[, studies.pos.count := uniqueN(study_id), by = list(dsstox_substance_id, endpoint_target_group)]
+
+# chemical and endpoint group and study type defines replicate
+endpoints.pos[, studies.pos.st := paste0(unique(study_id), collapse=","), 
+              by = list(dsstox_substance_id, endpoint_target_group, study_type)]
+endpoints.pos[, studies.pos.st.count := uniqueN(study_id), by = list(dsstox_substance_id, endpoint_target_group, study_type)]
+
+# chemical and endpoint group and species defines replicate
+endpoints.pos[, studies.pos.sp := paste0(unique(study_id), collapse=","), by = list(dsstox_substance_id, endpoint_target_group, species)]
+endpoints.pos[, studies.pos.sp.count := uniqueN(study_id), by = list(dsstox_substance_id, endpoint_target_group, species)]
+
+```
+
+* We implement this same replicate grouping in the endpoints.tested, for comparison.
+* Looks like 2284 studies included and 538 chemicals (slightly increased number due to studies tested but negative).
+
+```{r, warning=FALSE, eval=FALSE}
+
+# chemical and endpoint group defines replicate
+endpoints.tested[, studies.tested := paste0(unique(study_id),collapse=","), by= list(dsstox_substance_id, endpoint_target_group)]
+endpoints.tested[, studies.tested.count := uniqueN(study_id), by = list(dsstox_substance_id, endpoint_target_group)]
+
+# chemical and endpoint group and study type defines replicate
+endpoints.tested[, studies.tested.st := paste0(unique(study_id), collapse=","), 
+              by = list(dsstox_substance_id, endpoint_target_group, study_type)]
+endpoints.tested[, studies.tested.st.count := uniqueN(study_id), by = list(dsstox_substance_id, endpoint_target_group, study_type)]
+
+# chemical and endpoint group and species defines replicate
+endpoints.tested[, studies.tested.sp := paste0(unique(study_id), collapse=","), by = list(dsstox_substance_id, endpoint_target_group, species)]
+endpoints.tested[, studies.tested.sp.count := uniqueN(study_id), by = list(dsstox_substance_id, endpoint_target_group, species)]
+
+test <- endpoints.tested[studies.tested.count >1]
+length(unique(test[,study_id]))
+length(unique(test[,dsstox_substance_id]))
+```
+
+* The endpoint.pos is summarized here to just the information needed for qualitative reproducibility.
+* This enables a merge with the endpoints.tested for comparison, and to infer the substances that were all positive, all negative, and mixed when tested in multiple studies (per the different replicate definitions).
+
+```{r, warning=FALSE, eval=FALSE}
+
+endpoints.pos.summary <- unique(endpoints.pos[,c('chemical_id',
+                                                 'dsstox_substance_id',
+                                                 'casrn',
+                                                 'preferred_name',
+                                                 'endpoint_target_group',
+                                                 'study_type',
+                                                 'species',
+                                                 'studies.pos',
+                                                 'studies.pos.count',
+                                                 'studies.pos.st',
+                                                 'studies.pos.st.count',
+                                                 'studies.pos.sp',
+                                                 'studies.pos.sp.count'
+                                                 )])
+
+endpoints.tested.summary <- unique(endpoints.tested[,c(
+                                                 'dsstox_substance_id',
+                                                 'casrn',
+                                                 'preferred_name',
+                                                 'endpoint_target_group',
+                                                 'study_type',
+                                                 'species',
+                                                 'studies.tested',
+                                                 'studies.tested.count',
+                                                 'studies.tested.st',
+                                                 'studies.tested.st.count',
+                                                 'studies.tested.sp',
+                                                 'studies.tested.sp.count'
+                                                 )])
+```
+
+
+```{r, warning=FALSE, eval=FALSE}
+concord.tbl <- merge.data.table(endpoints.pos.summary,
+                                endpoints.tested.summary,
+                                by = c('dsstox_substance_id','casrn','preferred_name','endpoint_target_group','study_type','species'),
+                                all = TRUE)
+```
+
+## Get BMD dataset for variance estimation
+
+* Get all of the BMD values for the endpoint ids included in the study_ids within this work.
+* BMDs only available stored in ToxRefDB v2.0 only (not included in 2.1/deprecated)
+* Refine this dataset after the LEL variance dataset is made so that values can be matched.
+
+```{r, warning=FALSE}
+
+# connection to toxrefdb v2.0
+con2 <- dbConnect(drv = RMySQL::MySQL(),  user="_dataminer", password="pass",host="ccte-mysql-res.epa.gov", database=prod_toxrefdb_2_0) # this is toxrefdb v2.0 released 2019
+
+```
+
+
+```{r, warning=FALSE, eval=FALSE}
+
+all.bmd <- dbGetQuery(con2,"SELECT * FROM prod_toxrefdb_2_0.bmd_models INNER JOIN prod_toxrefdb_2_0.study ON study.study_id = bmd_models.study_id INNER JOIN prod_toxrefdb_2_0.chemical ON chemical.chemical_id=study.chemical_id INNER JOIN prod_toxrefdb_2_0.endpoint ON endpoint.endpoint_id=bmd_models.endpoint_id;") %>% data.table() # this is so we can do study-level BMD variance estimates
+
+organ.bmd <- dbGetQuery(con2,"SELECT * FROM prod_toxrefdb_2_0.bmd_models INNER JOIN prod_toxrefdb_2_0.study ON study.study_id = bmd_models.study_id INNER JOIN prod_toxrefdb_2_0.chemical ON chemical.chemical_id=study.chemical_id INNER JOIN prod_toxrefdb_2_0.endpoint ON endpoint.endpoint_id=bmd_models.endpoint_id WHERE endpoint.endpoint_id IN (348, 300, 220, 231, 381, 95, 140, 267, 109, 
+                               222, 268, 269, 137, 361, 54, 334, 100, 2, 82, 364, 395, 246, 313, 271, 87, 187, 10,
+                               143, 265, 376, 322, 119, 281, 315, 11);") %>% as.data.table()
+```
+
+* Here we save the datasets needed for analysis.
+
+```{r, warning=FALSE, eval=FALSE}
+save(tbl,
+     endpoints.tested,
+     endpoints.pos,
+     endpoints.tested.summary,
+     endpoints.pos.summary,
+     concord.tbl,
+     all.bmd,
+     organ.bmd,
+     file='./source/endpoints_tested&positive.RData')
+
+list_source <- list( 'source data for pos endpoints' = as.data.frame(tbl),
+                    'positive_endpoints for variance' = as.data.frame(endpoints.pos),
+                    'all bmds for variance' = as.data.frame(all.bmd),
+                    'organ bmds for variance' = as.data.frame(organ.bmd)
+                  )
+
+write.xlsx(list_source, file='./source/Source_Data_from_Toxref_2_1.xlsx')
+
+```
+
+# Part A: Concordance: reproducibility of Organ Level Effects {.tabset .tabset-fade .tabset-pills}
+
+In this section, we present an approach to calculating concordance.
+
+```{r, warning=FALSE}
+
+load(file='./source/endpoints_tested&positive.RData')
+
+```
+
+The table we need is the "concord.tbl" in the source endpoints_tested&positive.RData. From there, we can manipulate this table into binary results for concordance estimation.
+
+```{r, warning=FALSE}
+
+# make positive study counts interpretable by changing NA to 0
+
+cols = c('studies.pos.count',
+              'studies.pos.st.count',
+              'studies.pos.sp.count')
+concord.tbl[ , (cols) := lapply(.SD, nafill, fill=0), .SDcols=cols]
+concord.tbl <- concord.tbl[endpoint_target_group %in% c('adrenal gland','kidney','liver','spleen','stomach','thyroid gland')]
+```
+
+## By chemical and endpoint target group
+
+```{r, warning=FALSE}
+
+# understand concordance by endpoint target group only
+concord.tbl.endpt <- unique(concord.tbl[,c('dsstox_substance_id','casrn','preferred_name','endpoint_target_group','studies.pos','studies.pos.count','studies.tested','studies.tested.count')])
+
+# noticed some strangeness with hexaconazole. This resulted as one of the studies was not considered guideline quality and did not meet guideline profile requirements. We remove the offending rows that result.
+
+
+
+
+concord.tbl.endpt <- concord.tbl.endpt[order(dsstox_substance_id, endpoint_target_group, -studies.pos.count)]
+
+concord.tbl.endpt <- concord.tbl.endpt %>% group_by(dsstox_substance_id, endpoint_target_group) %>%
+  filter(studies.pos.count ==max(studies.pos.count)) %>% ungroup() %>% data.table()
+
+concord.tbl.endpt[, pos.endpoint := studies.pos.count/studies.tested.count]
+
+summ.concord.tbl.endpt <- concord.tbl.endpt[studies.tested.count>1,list(
+  total.pos.chem = uniqueN(dsstox_substance_id[pos.endpoint==1]),
+  total.neg.chem = uniqueN(dsstox_substance_id[pos.endpoint==0]),
+  total.chem = uniqueN(dsstox_substance_id)
+), by=list(endpoint_target_group)]
+
+summ.concord.tbl.endpt[,total.mixed.chem := total.chem-(total.pos.chem + total.neg.chem)]
+summ.concord.tbl.endpt[,pct.concordant := signif(((total.pos.chem + total.neg.chem)/total.chem)*100, 3)]
+setcolorder(summ.concord.tbl.endpt, c('endpoint_target_group','pct.concordant','total.chem','total.pos.chem','total.neg.chem','total.mixed.chem'))
+summ.concord.tbl.endpt <- summ.concord.tbl.endpt[endpoint_target_group %in% c('adrenal gland','kidney','liver','spleen','stomach','thyroid gland')]
+
+datatable(summ.concord.tbl.endpt, colnames=c('Endpoint Target Group','Percent Concordant','Total Chemicals','Positive Chemicals','Negative Chemicals','Mixed Response Chemicals'),
+          #filter='top', 
+          fillContainer = FALSE,
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+```
+
+## By chemical, endpoint target group, and study type
+
+```{r, warning=FALSE}
+
+concord.tbl.endpt.st <- unique(concord.tbl[,c('dsstox_substance_id','casrn','preferred_name',
+                                              'endpoint_target_group','study_type','studies.pos.st','studies.pos.st.count',
+                                              'studies.tested.st','studies.tested.st.count')])
+
+concord.tbl.endpt.st <- concord.tbl.endpt.st[order(dsstox_substance_id, endpoint_target_group, study_type, -studies.pos.st.count)]
+
+concord.tbl.endpt.st <- concord.tbl.endpt.st %>% group_by(dsstox_substance_id, endpoint_target_group, study_type) %>%
+  filter(studies.pos.st.count ==max(studies.pos.st.count)) %>% ungroup() %>% data.table()
+
+concord.tbl.endpt.st[, pos.endpoint.st := studies.pos.st.count/studies.tested.st.count]
+
+summ.concord.tbl.endpt.st <- concord.tbl.endpt.st[studies.tested.st.count>1,list(
+  total.pos.chem = uniqueN(dsstox_substance_id[pos.endpoint.st==1]),
+  total.neg.chem = uniqueN(dsstox_substance_id[pos.endpoint.st==0]),
+  total.chem = uniqueN(dsstox_substance_id)
+), by=list(endpoint_target_group, study_type)]
+
+summ.concord.tbl.endpt.st[,total.mixed.chem := total.chem-(total.pos.chem + total.neg.chem)]
+summ.concord.tbl.endpt.st[,pct.concordant := signif(((total.pos.chem + total.neg.chem)/total.chem)*100, 3)]
+
+# length(unique(concord.tbl[study_type=='CHR' & studies.tested.st.count >1,c('dsstox_substance_id','study_type')]$dsstox_substance_id)) #463 chemicals
+# length(unique(concord.tbl[study_type=='SUB' & studies.tested.st.count >1,c('dsstox_substance_id','study_type')]$dsstox_substance_id)) #306 chemicals
+# length(unique(concord.tbl[study_type=='SAC' & studies.tested.st.count >1,c('dsstox_substance_id','study_type')]$dsstox_substance_id)) #22 chemicals
+# suggest that the SAC data are not plentiful enough and should be dropped
+
+summ.concord.tbl.endpt.st <- summ.concord.tbl.endpt.st[!study_type=='SAC']
+
+setcolorder(summ.concord.tbl.endpt.st, c('endpoint_target_group','study_type','pct.concordant','total.chem','total.pos.chem','total.neg.chem','total.mixed.chem'))
+
+datatable(summ.concord.tbl.endpt.st, colnames=c('Endpoint Target Group','Study Type','Percent Concordant','Total Chemicals','Positive Chemicals','Negative Chemicals','Mixed Response Chemicals'),
+          #filter='top', 
+          fillContainer = FALSE,
+          options=list(pagelength=15, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+
+```
+
+## By chemical, endpoint target group, and species
+
+```{r, warning=FALSE}
+# understand concordance by endpoint target group and species
+
+concord.tbl.endpt.sp <- unique(concord.tbl[,c('dsstox_substance_id','casrn','preferred_name',
+                                              'endpoint_target_group','species','studies.pos.sp','studies.pos.sp.count',
+                                              'studies.tested.sp','studies.tested.sp.count')])
+
+concord.tbl.endpt.sp <- concord.tbl.endpt.sp[order(dsstox_substance_id, endpoint_target_group, species, -studies.pos.sp.count)]
+
+concord.tbl.endpt.sp <- concord.tbl.endpt.sp %>% group_by(dsstox_substance_id, endpoint_target_group, species) %>%
+  filter(studies.pos.sp.count ==max(studies.pos.sp.count)) %>% ungroup() %>% data.table()
+
+concord.tbl.endpt.sp[, pos.endpoint.sp := studies.pos.sp.count/studies.tested.sp.count]
+
+summ.concord.tbl.endpt.sp <- concord.tbl.endpt.sp[studies.tested.sp.count>1,list(
+  total.pos.chem = uniqueN(dsstox_substance_id[pos.endpoint.sp==1]),
+  total.neg.chem = uniqueN(dsstox_substance_id[pos.endpoint.sp==0]),
+  total.chem = uniqueN(dsstox_substance_id)
+), by=list(endpoint_target_group, species)]
+
+summ.concord.tbl.endpt.sp[,total.mixed.chem := total.chem-(total.pos.chem + total.neg.chem)]
+summ.concord.tbl.endpt.sp[,pct.concordant := signif(((total.pos.chem + total.neg.chem)/total.chem)*100, 3)]
+summ.concord.tbl.endpt.sp <- summ.concord.tbl.endpt.sp[order(endpoint_target_group, species)]
+
+#length(unique(concord.tbl[species=='mouse' & studies.tested.sp.count >1,c('dsstox_substance_id','species')]$dsstox_substance_id)) #219 chemicals
+#length(unique(concord.tbl[species=='rat' & studies.tested.sp.count >1,c('dsstox_substance_id','species')]$dsstox_substance_id)) #354 chemicals
+#length(unique(concord.tbl[species=='dog' & studies.tested.sp.count >1,c('dsstox_substance_id','species')]$dsstox_substance_id)) #169 chemicals
+
+setcolorder(summ.concord.tbl.endpt.sp, c('endpoint_target_group','species','pct.concordant','total.chem','total.pos.chem','total.neg.chem','total.mixed.chem'))
+
+datatable(summ.concord.tbl.endpt.sp, colnames=c('Endpoint Target Group','Species','Percent Concordant','Total Chemicals','Positive Chemicals','Negative Chemicals','Mixed Response Chemicals'),
+          #filter='top', 
+          fillContainer = FALSE,
+          options=list(pagelength=15, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+```
+
+## Concordance summary figure
+
+* Need to group tables
+
+```{r, warning=F, message=F}
+
+# add in grouping element
+summ.concord.tbl.endpt[, group := 'endpoint target group']
+summ.concord.tbl.endpt.st[, group := 'endpoint target group & study type']
+summ.concord.tbl.endpt.sp[, group := 'endpoint target group & species']
+
+# change column names to the grouping element
+summ.concord.tbl.endpt[, label := 'all']
+setnames(summ.concord.tbl.endpt.sp, c('species'), c('label'))
+setnames(summ.concord.tbl.endpt.st, c('study_type'), c('label'))
+
+
+list.concord <- list(summ.concord.tbl.endpt,
+                              summ.concord.tbl.endpt.st,
+                              summ.concord.tbl.endpt.sp)
+
+summ.concord.tbl.all <- rbindlist(list.concord, use.names=TRUE)
+
+datatable(summ.concord.tbl.all,colnames=c('Endpoint Target Group','Percent Concordant','Total Chemicals','Positive Chemicals','Negative Chemicals','Mixed Response Chemicals', 'Grouping', 'Label'),
+          #filter='top', 
+          fillContainer = FALSE,
+          options=list(pagelength=15, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+```
+
+
+```{r, warning=F, message=F, fig.height=6, fig.width=10}
+
+
+summ.concord.tbl.all$graph.labels <- factor(summ.concord.tbl.all$label, levels = c("all", "CHR", "SUB","dog","mouse","rat"))
+
+pct.concordance <- ggplot(summ.concord.tbl.all, 
+       aes(x=endpoint_target_group, y=pct.concordant, shape=graph.labels, color=total.chem))+
+  geom_point(size=4, stroke=2)+
+  theme_bw(base_size=16)+
+  labs(y="% Concordance", x="Organ", color="Sample Size", shape="Subset")+
+  scale_color_viridis_b(end=.9)+
+  scale_shape_manual(values=c(8, 15,16,17,18,25))+
+  guides(shape = guide_legend(override.aes = list(size=3, stroke=1)))+
+  theme(axis.text.x = element_text(size=14, angle=45, hjust=1), 
+        axis.text.y = element_text(size=14),
+        axis.title = element_text(size=16))+
+  scale_x_discrete(labels=c('adrenal','kidney','liver','spleen','stomach','thyroid'))
+
+pct.concordance
+
+```
+
+```{r, warning=F, eval=F, echo=F}
+# export figure
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig2_pct_concordance_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=4000, height=3000, res=480)
+pct.concordance
+dev.off()
+
+```
+
+```{r, warning=FALSE, eval=F}
+
+list_concord_data <- list("by_endpt" = as.data.frame(summ.concord.tbl.endpt),
+                          "by_endpt&study_type" = as.data.frame(summ.concord.tbl.endpt.st),
+                          "by_endpt&species" = as.data.frame(summ.concord.tbl.endpt.sp),
+                          "concordance_tbl" = as.data.frame(concord.tbl),
+                          "summary_concordance"= as.data.frame(summ.concord.tbl.all),
+                          "by_endpt_all" = as.data.frame(concord.tbl.endpt),
+                          "by_endpt&studytype_all" = as.data.frame(concord.tbl.endpt.st),
+                          "by_endpt&species_all" = as.data.frame(concord.tbl.endpt.sp))
+
+write.xlsx(list_concord_data, file="./output/concordance_results.xlsx")
+
+save(summ.concord.tbl.all,
+     summ.concord.tbl.endpt,
+     summ.concord.tbl.endpt.sp,
+     summ.concord.tbl.endpt.st,
+     concord.tbl.endpt,
+     concord.tbl.endpt.sp,
+     concord.tbl.endpt.st,
+     concord.tbl,
+     endpoints.pos,
+     endpoints.tested, file='./output/concordance_results_dataset.RData')
+
+```
+
+
+# Part B: Variance by Organ-level Effects {.tabset .tabset-fade .tabset-pills}
+
+* In these sections, define the variance in positive, organ-level findings by chemical.
+* Is the variance reduced from the overall study-level variance from Pham et al. 2020?
+
+## Refine the dataset
+
+* Load in the augmented cell means (ACM) dataset from Pham et al. 2020.
+```{r, warning=FALSE}
+acm.full <- as.data.table(read.xlsx('./source/SuppFile1_Pham_etal_full_datasets_31oct2019.xlsx', # load ACM dataset from Pham et al. 2020
+                                    sheet="ACM_full_dataset",
+                                    colNames = TRUE))
+```
+
+* Prepare a table for variance estimation using multilinear regression (MLR).
+* Note that we derive log_dose_adjusted, which can be used for any quantitative analysis.
+* For each chemical, study, and endpoint_target_group, we define the minimum LEL (based on the log_dose_adjusted reported for effects).
+
+```{r, warning=FALSE}
+
+endpoint_target_groups <- unique(endpoints.pos[,endpoint_target_group]) # use the endpoint_target_groups that were created
+pod.tbl <- as.data.table(endpoints.pos)
+
+pod.tbl[ , log_dose_adjusted := log10(dose_adjusted) ]
+#unique(pod.tbl$dose_adjusted_unit) # confirm that all are the correct unit of mg/kg/day
+pod.tbl[,log_dose_adjusted_unit := as.character('log10-mg/kg/day')]
+
+pod.tbl[, endpt.lel := min(log_dose_adjusted[treatment_related == 1], na.rm = TRUE), by = list(study_id,endpoint_target_group)]
+pod.tbl[,study_count := uniqueN(study_id), by=list(dsstox_substance_id, endpoint_target_group)]
+pod.tbl[,study_ids := paste0(unique(study_id), collapse=","), by=list(dsstox_substance_id,endpoint_target_group)]
+pod.tbl <- pod.tbl[study_count>1] # each chemical must have 2 studies with lel values at each endpoint_target_group
+
+pod.tbl[,effect_desc_list := paste0(unique(effect_desc),collapse = ","), by=list(dsstox_substance_id,endpoint_target_group)]
+
+# create the unique dataset
+
+data.pod <- unique(pod.tbl[,c('chemical_id',
+                              'dsstox_substance_id',
+                              'casrn',
+                              'preferred_name',
+                              'study_id',
+                              'study_type',
+                              'study_year',
+                              'study_source',
+                              'life_stage',
+                              'sex', 
+                              'generation',
+                              'species',
+                              'strain_group',
+                              'admin_route',
+                              'admin_method',
+                              'substance_purity',
+                              'endpoint_id',
+                              'endpoint_target_group',
+                              'effect_desc_list',
+                              'study_count',
+                              'study_ids',
+                              'endpt.lel',
+                              'log_dose_adjusted_unit')])
+
+tbl[!is.na(dose_level), dose_no := max(dose_level, na.rm = TRUE) , by = study_id]
+tbl[dose_adjusted > 0, log_dose_adjusted := log10(dose_adjusted)]
+tbl[!is.na(log_dose_adjusted), ldt := min(log_dose_adjusted), by = study_id] #ldt = lowest dose tested in the study
+tbl[!is.na(log_dose_adjusted), hdt := max(log_dose_adjusted), by = study_id] #hdt = highest dose tested in the study
+tbl[ , dose_spacing := (hdt-ldt)/(dose_no-1)]
+
+# all of these values can be added to the dataset, keyed by study_id since they are calculated at the study_level
+data.pod$ldt <- tbl$ldt[match(data.pod$study_id,
+                              tbl$study_id)]
+data.pod$hdt <- tbl$hdt[match(data.pod$study_id,
+                              tbl$study_id)]
+data.pod$dose_no <- tbl$dose_no[match(data.pod$study_id,
+                                      tbl$study_id)]
+data.pod$dose_spacing <- tbl$dose_spacing[match(data.pod$study_id,
+                                      tbl$study_id)]
+
+is.na(data.pod) <- do.call(cbind,lapply(data.pod, is.infinite)) # make any Inf values into NA
+
+# center these values for MLR testing, as done for Pham et al.
+mean.study.year <- round(mean(data.pod$study_year, na.rm=TRUE),0) #1990
+mean.sub.pur <- round(mean(data.pod$substance_purity, na.rm=TRUE),1) #94
+mean.dose.spacing <- round(mean(data.pod$dose_spacing, na.rm=TRUE),1) #0.6
+
+data.pod[is.na(study_year), study_year := mean.study.year]
+data.pod[is.na(substance_purity), substance_purity := mean.sub.pur]
+data.pod[is.na(dose_spacing), dose_spacing := mean.dose.spacing]
+
+data.pod <- unique(data.pod) %>%
+  .[ , sub_purity_center := mean.sub.pur] %>%
+  .[ , study_year_center := study_year - mean.study.year] %>% 
+  .[ , dose_spacing_center := dose_spacing - mean.dose.spacing]
+
+# cast the data wide so that each endpoint_target_group is a column
+# I cast this without sex with the assumption that the minimum for both sexes would be appropriate
+data.pod.wide <- dcast.data.table(data.pod,
+                                  chemical_id + dsstox_substance_id + casrn + preferred_name + study_id + study_type + study_source + life_stage
+                                  + generation + species + strain_group + admin_method + substance_purity + sub_purity_center +
+                                    study_year_center + dose_spacing_center + dose_no ~ endpoint_target_group,
+                                 value.var = c("endpt.lel"),
+                                 fun.aggregate = (min))
+
+is.na(data.pod.wide) <- do.call(cbind,lapply(data.pod.wide, is.infinite)) # replace Inf with NA
+
+# explore data: how many substances with replicate values per endpoint_target_group?
+
+#colnames(data.pod.wide)
+setnames(data.pod.wide, c('adrenal gland', 'thyroid gland'), c('adrenal', 'thyroid'))
+```
+
+* The number of substances by endpoint target group (organ)
+```{r, warning=FALSE}
+number.chems <- data.pod.wide[,list(
+  adrenal = length(unique(dsstox_substance_id[!is.na(adrenal)])),
+  kidney = length(unique(dsstox_substance_id[!is.na(kidney)])),
+  liver = length(unique(dsstox_substance_id[!is.na(liver)])),
+  spleen = length(unique(dsstox_substance_id[!is.na(spleen)])),
+  stomach = length(unique(dsstox_substance_id[!is.na(stomach)])),
+  thyroid = length(unique(dsstox_substance_id[!is.na(thyroid)]))
+)]
+
+datatable(number.chems, 
+          filter='top', 
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+```
+
+## MLR by endpoint target group for the full dataset
+
+```{r, warning=FALSE}
+
+set.seed(123456789)
+
+varnames <- names(data.pod.wide)[18:23] # columns of endpoint_target_group names
+mlr.data.full <- lapply(varnames,
+                        FUN=function(x) lm(formula(paste(x,
+                        "~0+factor(dsstox_substance_id)+factor(species)+factor(study_type)+factor(admin_method)+dose_spacing_center+dose_no+study_year_center+sub_purity_center")),
+                        data=data.pod.wide))
+names(mlr.data.full) <- varnames
+                      
+#anova(mlr.data.full$kidney) # test to see how this worked
+
+# create a summary table of the ANOVA results for these MLR models by endpoint_target_group
+# likely a neater way to do this with tidyr but this was fast and straightforward
+
+variance <- data.pod.wide[,list(
+  adrenal = round(var(adrenal[!is.na(adrenal)]),3),
+  kidney = round(var(kidney[!is.na(kidney)]),3),
+  liver = round(var(liver[!is.na(liver)]),3),
+  spleen = round(var(spleen[!is.na(spleen)]),3),
+  stomach = round(var(stomach[!is.na(stomach)]),3),
+  thyroid = round(var(thyroid[!is.na(thyroid)]),3)
+)]
+
+number.points <- data.pod.wide[,list(
+  adrenal = length((adrenal[!is.na(adrenal)])),
+  kidney = length((kidney[!is.na(kidney)])),
+  liver = length((liver[!is.na(liver)])),
+  spleen = length((spleen[!is.na(spleen)])),
+  stomach = length((stomach[!is.na(stomach)])),
+  thyroid = length((thyroid[!is.na(thyroid)]))
+)]
+
+dat.res <- as.data.table(cbind((t(number.chems)), (t(number.points)), (t(variance))))
+
+setnames(dat.res, c("V1", "V2", "V3"), c("Chemicals","N", "Var"))
+
+dat.res$endpoint_target_group <- varnames
+setcolorder(dat.res, c(4,1:3))
+
+# MSE of LEL models 
+
+# function to calculate MSE (sum(residuals^2)/error degrees of freedom)
+
+mse_func <- function(model) {
+  round(glance(model)$deviance / model$df.residual, 3) ##broom::glance()
+}
+
+# apply mse and rmse functions to the model_list
+
+mod.res <- mlr.data.full %>% {
+  tibble(MSE = map_dbl(., mse_func)) } %>%
+  mutate(RMSE = round(sqrt(MSE), 3))
+
+lel.model.results <- bind_cols(dat.res, mod.res)
+
+# taking MSE as an estimated of unexplained variance, the total variance - unexplained divided by total should give the explained/total
+
+lel.model.results[,`% var explained` := round(((Var-MSE)/Var)*100,1)]
+
+# make a table of the values to summarize the models
+
+datatable(lel.model.results, 
+          filter='top', 
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+```
+
+## MLR by endpoint target group for the curated dataset from Pham et al.
+
+* The replicate requirements of the ACM dataset are different.
+* For these studies, replicate was defined much more stringently (same study type, species, admin method).
+* This dataset is much smaller.
+* First, refine the dataset for this.
+
+```{r, warning=FALSE}
+
+# borrow curated dataset from Pham et al.
+
+endpoint_target_groups <- unique(endpoints.pos[,endpoint_target_group]) # use the endpoint_target_groups that were created
+pod.tbl2 <- as.data.table(endpoints.pos[study_id %in% acm.full[,study_id]]) # significantly smaller
+
+pod.tbl2[ , log_dose_adjusted := log10(dose_adjusted) ]
+#unique(pod.tbl2$dose_adjusted_unit) # confirm that all are the correct unit of mg/kg/day
+pod.tbl2[,log_dose_adjusted_unit := as.character('log10-mg/kg/day')]
+
+pod.tbl2[, endpt.lel := min(log_dose_adjusted[treatment_related == 1], na.rm = TRUE), by = list(study_id,endpoint_target_group)]
+pod.tbl2[,study_count := uniqueN(study_id), by=list(dsstox_substance_id, endpoint_target_group)]
+pod.tbl2[,study_ids := paste0(unique(study_id), collapse=","), by=list(dsstox_substance_id,endpoint_target_group)]
+pod.tbl2 <- pod.tbl2[study_count>1] # each chemical must have 2 studies with lel values at each endpoint_target_group
+
+# now I think we need to have one unique lel per study x endpoint_target_group combination so it doesn't inflate the dataset artificially
+
+pod.tbl2[,effect_desc_list := paste0(unique(effect_desc),collapse = ","), by=list(dsstox_substance_id,endpoint_target_group)]
+
+# create the unique dataset
+
+data.pod.cur <- unique(pod.tbl2[,c('chemical_id',
+                              'dsstox_substance_id',
+                              'casrn',
+                              'preferred_name',
+                              'study_id',
+                              'study_type',
+                              'study_year',
+                              'study_source',
+                              'life_stage',
+                              'sex', # i was debating removing sex - left in for now. could remove later. sex will make it appear like there are two groups.
+                              'generation',
+                              'species',
+                              'strain_group',
+                              'admin_route',
+                              'admin_method',
+                              'substance_purity',
+                              'endpoint_target_group',
+                              'effect_desc_list',
+                              'study_count',
+                              'study_ids',
+                              'endpt.lel',
+                              'log_dose_adjusted_unit')])
+
+
+# all of these values can be added to the dataset, keyed by study_id since they are calculated at the study_level
+data.pod.cur$ldt <- tbl$ldt[match(data.pod.cur$study_id,
+                              tbl$study_id)]
+data.pod.cur$hdt <- tbl$hdt[match(data.pod.cur$study_id,
+                              tbl$study_id)]
+data.pod.cur$dose_no <- tbl$dose_no[match(data.pod.cur$study_id,
+                                      tbl$study_id)]
+data.pod.cur$dose_spacing <- tbl$dose_spacing[match(data.pod.cur$study_id,
+                                                tbl$study_id)]
+
+is.na(data.pod.cur) <- do.call(cbind,lapply(data.pod.cur, is.infinite)) # make any Inf values into NA
+
+# center these values for MLR testing, as done for Pham et al.
+mean.study.year <- round(mean(data.pod.cur$study_year, na.rm=TRUE),0) #1989, changed by 1 yr
+mean.sub.pur <- round(mean(data.pod.cur$substance_purity, na.rm=TRUE),1) #94
+mean.dose.spacing <- round(mean(data.pod.cur$dose_spacing, na.rm=TRUE),1) #0.6
+
+data.pod.cur[is.na(study_year), study_year := mean.study.year]
+data.pod.cur[is.na(substance_purity), substance_purity := mean.sub.pur]
+data.pod.cur[is.na(dose_spacing), dose_spacing := mean.dose.spacing]
+
+data.pod.cur <- unique(data.pod.cur) %>%
+  .[ , sub_purity_center := mean.sub.pur] %>%
+  .[ , study_year_center := study_year - mean.study.year] %>% 
+  .[ , dose_spacing_center := dose_spacing - mean.dose.spacing]
+
+# cast the data wide so that each endpoint_target_group is a column
+# I cast this without sex with the assumption that the minimum for both sexes would be appropriate
+data.pod.cur.wide <- dcast.data.table(data.pod.cur,
+                                  chemical_id + dsstox_substance_id + casrn + preferred_name + study_id + study_type + study_source + life_stage
+                                  + generation + species + strain_group + admin_method + substance_purity + sub_purity_center +
+                                    study_year_center + dose_spacing_center + dose_no ~ endpoint_target_group,
+                                  value.var = c("endpt.lel"),
+                                  fun.aggregate = (min))
+
+is.na(data.pod.cur.wide) <- do.call(cbind,lapply(data.pod.cur.wide, is.infinite)) # replace Inf with NA
+
+
+#colnames(data.pod.cur.wide)
+setnames(data.pod.cur.wide, c('adrenal gland', 'thyroid gland'), c('adrenal', 'thyroid'))
+```
+
+* Next run the MLR for the curated dataset.
+
+```{r, warning=FALSE}
+
+set.seed(123456789)
+
+varnames <- names(data.pod.cur.wide)[18:23] # columns of endpoint_target_group names
+
+# you will want to check how many levels each of the factors has; I removed admin_mthd and it seemed to run okay
+
+mlr.data.cur <- lapply(varnames,
+                        FUN=function(x) lm(formula(paste(x,
+                                                         "~0+factor(dsstox_substance_id)+factor(species)+factor(study_type)+dose_spacing_center+dose_no+study_year_center+sub_purity_center")),
+                                           data=data.pod.cur.wide))
+names(mlr.data.cur) <- varnames
+
+#anova(mlr.data.cur$kidney) # test to see how this worked
+
+# create a summary table of the ANOVA results for these MLR models by endpoint_target_group
+
+number.chems.cur <- data.pod.cur.wide[,list(
+  adrenal = length(unique(dsstox_substance_id[!is.na(adrenal)])),
+  kidney = length(unique(dsstox_substance_id[!is.na(kidney)])),
+  liver = length(unique(dsstox_substance_id[!is.na(liver)])),
+  spleen = length(unique(dsstox_substance_id[!is.na(spleen)])),
+  stomach = length(unique(dsstox_substance_id[!is.na(stomach)])),
+  thyroid = length(unique(dsstox_substance_id[!is.na(thyroid)]))
+)]
+
+
+variance.cur <- data.pod.cur.wide[,list(
+  adrenal = round(var(adrenal[!is.na(adrenal)]),3),
+  kidney = round(var(kidney[!is.na(kidney)]),3),
+  liver = round(var(liver[!is.na(liver)]),3),
+  spleen = round(var(spleen[!is.na(spleen)]),3),
+  stomach = round(var(stomach[!is.na(stomach)]),3),
+  thyroid = round(var(thyroid[!is.na(thyroid)]),3)
+)]
+
+number.points.cur <- data.pod.cur.wide[,list(
+  adrenal = length((adrenal[!is.na(adrenal)])),
+  kidney = length((kidney[!is.na(kidney)])),
+  liver = length((liver[!is.na(liver)])),
+  spleen = length((spleen[!is.na(spleen)])),
+  stomach = length((stomach[!is.na(stomach)])),
+  thyroid = length((thyroid[!is.na(thyroid)]))
+)]
+
+dat.res.cur <- as.data.table(cbind((t(number.chems.cur)), (t(number.points.cur)), (t(variance.cur))))
+#colnames(dat.res.cur)
+setnames(dat.res.cur, c("V1", "V2", "V3"), c("Chemicals","N", "Var"))
+
+dat.res.cur$endpoint_target_group <- varnames
+setcolorder(dat.res.cur, c(4,1:3))
+
+# MSE of LEL models 
+
+# apply mse and rmse functions to the model_list
+
+mod.res.cur <- mlr.data.cur %>% {
+  tibble(MSE = map_dbl(., mse_func)) } %>%
+  mutate(RMSE = round(sqrt(MSE), 3))
+
+lel.cur.model.results <- bind_cols(dat.res.cur, mod.res.cur)
+
+# make a table of the values to summarize the models
+lel.cur.model.results[,`% var explained` := round(((Var-MSE)/Var)*100,1)]
+
+# make a table of the values to summarize the models
+
+datatable(lel.cur.model.results, 
+          filter='top', 
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+# liver and kidney may be the only ones with enough data to draw any logical inferences
+# Curation did not seem to reduce the variance
+
+
+```
+
+## Variance with BMDs by study
+
+* First find the usable set of BMDs for study level variance estimates.
+* BMD tables from ToxRefDB v2.0
+* A number of BMRs are used. We decide to take the min these BMDs per study, similar to how we treat LEL.
+
+```{r, warning=FALSE}
+head(all.bmd)
+```
+
+```{r, warning=FALSE}
+all.bmd.rec <- all.bmd[recommended==1] # subsetted to recommended model only for all BMDs available
+all.bmd.rec <- all.bmd.rec[endpoint_category %in% c('systemic')] # systemic effects only
+all.bmd.rec <- all.bmd.rec[study_type %in% c('CHR','SAC','SUB')] # only repeat dose study types
+all.bmd.rec[,study_count := uniqueN(study_id), by=list(dsstox_substance_id)] # calculate number of studies so we only look at chemicals with a study_count >1
+all.bmd.use <- all.bmd.rec[study_count > 1]
+
+length(unique(all.bmd.use$study_id)) #1448 studies
+length(unique(all.bmd.use$dsstox_substance_id)) #404 substances
+mean(all.bmd.use$study_count) # 4.5
+```
+
+```{r, warning=FALSE}
+# need to calculate the log10 dose adjusted for BMDL, BMDU, BMD
+all.bmd.use[, log10.BMDL := log10(BMDL)]
+all.bmd.use[, log10.BMD := log10(BMD)]
+all.bmd.use[, log10.BMDU := log10(BMDU)]
+```
+
+
+* Learn a bit more about the BMDs
+
+```{r, warning=FALSE}
+
+table(all.bmd.use[,c('bmr_type','bmr', 'recommended_variable')])
+
+```
+
+```{r, warning=FALSE}
+
+table(all.bmd.use$endpoint_type)
+
+```
+
+```{r, warning=FALSE}
+
+table(all.bmd.use$model_name)
+
+```
+
+* Proceed to prepare the minBMD per study for MLR
+* There are some studies where BMDL computation fails, and then even more where BMDU fails, so BMD is appropriate metric (and closest to LEL)
+
+```{r,warning=FALSE}
+
+data.bmd.study <- unique(all.bmd.use[,c('chemical_id',
+                              'dsstox_substance_id',
+                              'casrn',
+                              'preferred_name',
+                              'study_id',
+                              'study_type',
+                              'study_year',
+                              'study_source',
+                              'species',
+                              'strain_group',
+                              'admin_route',
+                              'admin_method',
+                              'substance_purity',
+                              'endpoint_id',
+                              'tg_effect_id',
+                              'study_count',
+                              'log10.BMD',
+                              'log10.BMDL',
+                              'log10.BMDU',
+                              'bmr',
+                              'bmr_type')])
+
+head(data.bmd.study)
+
+```
+
+```{r, warning=FALSE}
+
+# need to understand dose-spacing, number of doses, and centered study year on a whole study basis. 
+# let's use the whole dataset to do this, this was already calculated for the MLR
+# all of these values can be added to the dataset, keyed by study_id since they are calculated at the study_level
+
+data.bmd.study$ldt <- tbl$ldt[match(data.bmd.study$study_id,
+                              tbl$study_id)]
+data.bmd.study$hdt <- tbl$hdt[match(data.bmd.study$study_id,
+                              tbl$study_id)]
+data.bmd.study$dose_no <- tbl$dose_no[match(data.bmd.study$study_id,
+                                      tbl$study_id)]
+data.bmd.study$dose_spacing <- tbl$dose_spacing[match(data.bmd.study$study_id,
+                                      tbl$study_id)]
+
+#is.na(data.bmd.study) <- do.call(cbind,lapply(data.bmd.study, is.infinite)) # make any Inf values into NA
+
+# center these values for MLR testing, as done for Pham et al.
+
+data.bmd.study$substance_purity <- as.numeric(data.bmd.study$substance_purity)
+
+mean.study.year <- round(mean(data.bmd.study$study_year, na.rm=TRUE),0) #1992, slightly later than other datasets
+mean.sub.pur <- round(mean(data.bmd.study$substance_purity, na.rm=TRUE),1) #92.9
+mean.dose.spacing <- round(mean(data.bmd.study$dose_spacing, na.rm=TRUE),1) #0.6
+
+data.bmd.study[is.na(study_year), study_year := mean.study.year]
+data.bmd.study[is.na(substance_purity), substance_purity := mean.sub.pur]
+data.bmd.study[is.na(dose_spacing), dose_spacing := mean.dose.spacing]
+
+data.bmd.study <- unique(data.bmd.study) %>%
+  .[ , sub_purity_center := substance_purity - mean.sub.pur] %>%
+  .[ , study_year_center := study_year - mean.study.year] %>% 
+  .[ , dose_spacing_center := dose_spacing - mean.dose.spacing]
+
+head(data.bmd.study)
+
+```
+
+
+* create the table for variance estimation.
+
+```{r, warning=FALSE}
+
+data.bmd.study[, min.log10.BMD := min(log10.BMD), by=list(study_id)]
+data.bmd.study[, min.log10.BMDL := min(log10.BMDL), by=list(study_id)]
+data.bmd.study[, min.log10.BMDU := min(log10.BMDU), by=list(study_id)]
+
+```
+
+```{r, warning=FALSE}
+
+# uniquefy to study_id and min BMD per study
+
+data.bmd.study.unique <- unique(data.bmd.study[,c('dsstox_substance_id',
+                                                  'casrn',
+                                                  'preferred_name',
+                                                  'study_id',
+                                                  'study_type',
+                                                  'study_year',
+                                                  'study_source',
+                                                  'species',
+                                                  'strain_group',
+                                                  'admin_route',
+                                                  'admin_method',
+                                                  'substance_purity',
+                                                  'ldt',
+                                                  'hdt',
+                                                  'dose_no',
+                                                  'dose_spacing',
+                                                  'sub_purity_center',
+                                                  'study_year_center',
+                                                  'dose_spacing_center',
+                                                  'min.log10.BMD',
+                                                  'min.log10.BMDL', # missing some
+                                                  'min.log10.BMDU')]) # missing some
+
+data.bmd.study.unique[is.na(min.log10.BMD)]
+```
+
+* Now calculate the variance in study level minimum BMDs.
+
+```{r, warning=FALSE}
+
+set.seed(123456789)
+
+bmd.study.var <- round(var(data.bmd.study.unique$min.log10.BMD),3)
+bmd.study.chems <- length(unique(data.bmd.study.unique$dsstox_substance_id))
+bmd.study.N <- length(unique(data.bmd.study.unique$study_id))
+
+#setnames(dat.res.bmd, c("V1", "V2", "V3"), c("Chemicals","N", "Var"))
+
+data.bmd.study.summ <- data.table(
+                                  c(bmd.study.chems),
+                                  c(bmd.study.N),
+                                  c(bmd.study.var), 
+                                  c('BMDs, study-level'))
+
+
+setnames(data.bmd.study.summ, c('Chemicals','N','Var','Type'))
+
+# Multilinear regression model object
+
+mlr.data.bmd.study <- lm(min.log10.BMD ~0
+                         + factor(dsstox_substance_id)
+                         + factor(study_type)
+                         + factor(admin_method)
+                         + dose_spacing_center
+                         + dose_no
+                         + study_year_center
+                         + sub_purity_center, data=data.bmd.study)
+
+
+# Make lm summary output into a data.table
+
+mlr.data.bmd.study.out <- glance(mlr.data.bmd.study) %>% data.table()
+
+# Calculate MSE
+
+mlr.data.bmd.study.out[, MSE := round(deviance/df.residual, 3)]
+
+# Calculate MSE
+
+mlr.data.bmd.study.out[, RMSE := round(sqrt(MSE), 3)]
+
+bmd.model.results <- bind_cols(data.bmd.study.summ, mlr.data.bmd.study.out[,c('MSE','RMSE')])
+
+# taking MSE as an estimated of unexplained variance, the total variance - unexplained divided by total should give the explained/total
+
+bmd.model.results[,`% var explained` := round(((Var-MSE)/Var)*100,1)]
+
+# make a table of the values to summarize the models
+
+datatable(bmd.model.results, 
+          filter='top', 
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+```
+
+## Variance with BMDs by organ
+
+* Subset the BMD dataset to the winning models (recommended==1).
+* Subset to only include study_id's in the variance dataset.
+
+```{r, warning=FALSE}
+
+org.bmd.win <- organ.bmd[recommended==1] # subsetted to recommended model only
+#length(unique(org.bmd.win$study_id)) #1335 study_ids
+#length(unique(org.bmd.win$dsstox_substance_id)) #492 total chemicals
+
+head(org.bmd.win)
+
+```
+
+```{r, warning=FALSE}
+org.bmd.overlap <- org.bmd.win[study_id %in% data.pod[,study_id]] # only use study_ids in the other dataset 
+
+# need to assign endpoints to endpoint_target_group
+
+etg.adrenal <- unique(pod.tbl[endpoint_target_group=='adrenal gland', endpoint_id])
+etg.kidney <- unique(pod.tbl[endpoint_target_group=='kidney', endpoint_id])
+etg.liver <- unique(pod.tbl[endpoint_target_group=='liver', endpoint_id])
+etg.spleen <- unique(pod.tbl[endpoint_target_group=='spleen', endpoint_id])
+etg.stomach <- unique(pod.tbl[endpoint_target_group=='stomach', endpoint_id])
+etg.thyroid <- unique(pod.tbl[endpoint_target_group=='thyroid gland', endpoint_id])
+
+org.bmd.overlap[endpoint_id %in% etg.adrenal, endpoint_target_group := 'adrenal']
+org.bmd.overlap[endpoint_id %in% etg.kidney, endpoint_target_group := 'kidney']
+org.bmd.overlap[endpoint_id %in% etg.liver, endpoint_target_group := 'liver']
+org.bmd.overlap[endpoint_id %in% etg.spleen, endpoint_target_group := 'spleen']
+org.bmd.overlap[endpoint_id %in% etg.stomach, endpoint_target_group := 'stomach']
+org.bmd.overlap[endpoint_id %in% etg.thyroid, endpoint_target_group := 'thyroid']
+
+org.bmd.overlap <- org.bmd.overlap[endpoint_target_group %in% c('adrenal','kidney','liver','spleen','stomach','thyroid')]
+
+# need to only calculate variance for bmds where there is more than one study
+
+org.bmd.overlap[,study_count := uniqueN(study_id), by=list(dsstox_substance_id, endpoint_target_group)]
+org.bmd.reps <- org.bmd.overlap[study_count > 1]
+#length(unique(all.bmd.reps$study_id)) #901 studies
+#length(unique(all.bmd.reps$dsstox_substance_id)) #280 substances
+
+# need to calculate the log10 dose adjusted for BMDL, BMDU, BMD
+
+org.bmd.reps[, log10.BMDL := log10(BMDL)]
+org.bmd.reps[, log10.BMD := log10(BMD)]
+org.bmd.reps[, log10.BMDU := log10(BMDU)]
+
+
+```
+
+
+```{r, warning=FALSE}
+
+# calculate the min, mean, max, N per study x endpoint id combination
+
+org.bmd.reps[, min.log10.BMD := min(log10.BMD), by=list(study_id,dsstox_substance_id,endpoint_target_group)]
+org.bmd.reps[, mean.log10.BMD := mean(log10.BMD), by= list(study_id, dsstox_substance_id, endpoint_target_group)]
+org.bmd.reps[, max.log10.BMD := max(log10.BMD), by= list(study_id, dsstox_substance_id, endpoint_target_group)]
+org.bmd.reps[, N.log10.BMD := .N, by=list(study_id, dsstox_substance_id, endpoint_target_group)]
+
+
+
+hist(org.bmd.reps$min.log10.BMD)
+
+# I think we need the min log10 BMD per endpoint target group and study, not the max BMR.
+#org.bmd.reps.10 <- org.bmd.reps[, .SD[which.max(bmr)], by=tg_effect_id]
+
+
+```
+
+* Prepare the BMD dataset for MLR
+
+```{r, warning=FALSE}
+
+data.bmd.organ <- unique(org.bmd.reps[,c('chemical_id',
+                              'dsstox_substance_id',
+                              'casrn',
+                              'preferred_name',
+                              'study_id',
+                              'study_type',
+                              'study_year',
+                              'study_source',
+                              'species',
+                              'strain_group',
+                              'admin_route',
+                              'admin_method',
+                              'substance_purity',
+                              'endpoint_id',
+                              'tg_effect_id',
+                              'endpoint_target_group',
+                              'study_count',
+                              'log10.BMD')])
+
+# need to understand dose-spacing, number of doses, and centered study year on a whole study basis. 
+# let's use the whole dataset to do this, this was already calculated for the MLR
+# all of these values can be added to the dataset, keyed by study_id since they are calculated at the study_level
+data.bmd.organ$ldt <- tbl$ldt[match(data.bmd.organ$study_id,
+                              tbl$study_id)]
+data.bmd.organ$hdt <- tbl$hdt[match(data.bmd.organ$study_id,
+                              tbl$study_id)]
+data.bmd.organ$dose_no <- tbl$dose_no[match(data.bmd.organ$study_id,
+                                      tbl$study_id)]
+data.bmd.organ$dose_spacing <- tbl$dose_spacing[match(data.bmd.organ$study_id,
+                                      tbl$study_id)]
+
+is.na(data.bmd.organ) <- do.call(cbind,lapply(data.bmd.organ, is.infinite)) # make any Inf values into NA
+
+# center these values for MLR testing, as done for Pham et al.
+mean.study.year <- round(mean(data.bmd.organ$study_year, na.rm=TRUE),0) #1992
+data.bmd.organ$substance_purity <- as.numeric(data.bmd.organ$substance_purity)
+mean.sub.pur <- round(mean(data.bmd.organ$substance_purity, na.rm=TRUE),1) #94.5
+mean.dose.spacing <- round(mean(data.bmd.organ$dose_spacing, na.rm=TRUE),1) #0.7
+
+data.bmd.organ[is.na(study_year), study_year := mean.study.year]
+data.bmd.organ[is.na(substance_purity), substance_purity := mean.sub.pur]
+data.bmd.organ[is.na(dose_spacing), dose_spacing := mean.dose.spacing]
+
+data.bmd.organ <- unique(data.bmd.organ) %>%
+  .[ , sub_purity_center := substance_purity - mean.sub.pur] %>%
+  .[ , study_year_center := study_year - mean.study.year] %>% 
+  .[ , dose_spacing_center := dose_spacing - mean.dose.spacing]
+
+```
+
+* create the table for variance estimation.
+
+```{r, warning=FALSE}
+
+# cast the data wide so that each endpoint_target_group is a column
+# I cast this without sex with the assumption that the minimum for both sexes would be appropriate
+data.bmd.organ.wide <- dcast.data.table(data.bmd.organ,
+                                  chemical_id + dsstox_substance_id + casrn + preferred_name + study_id + study_type + study_source 
+                                 + species + strain_group + admin_method + substance_purity + sub_purity_center +
+                                    study_year_center + dose_spacing_center + dose_no ~ endpoint_target_group,
+                                 value.var = c("log10.BMD"),
+                                 fun.aggregate = (min))
+
+
+is.na(data.bmd.organ.wide) <- do.call(cbind,lapply(data.bmd.organ.wide, is.infinite)) # replace Inf with NA
+
+setnames(data.bmd.organ.wide, c('adrenal','kidney','liver','spleen','stomach','thyroid'), c('log10.BMD_adrenal','log10.BMD_kidney',
+                                                  'log10.BMD_liver',
+                                                  'log10.BMD_spleen',
+                                                  'log10.BMD_stomach',
+                                                  'log10.BMD_thyroid'))
+
+```
+
+* The number of substances by endpoint target group (organ)
+```{r, warning=FALSE}
+number.chems.bmd.organ <- data.bmd.organ.wide[,list(
+  adrenal = length(unique(dsstox_substance_id[!is.na(log10.BMD_adrenal)])),
+  kidney = length(unique(dsstox_substance_id[!is.na(log10.BMD_kidney)])),
+  liver = length(unique(dsstox_substance_id[!is.na(log10.BMD_liver)])),
+  spleen = length(unique(dsstox_substance_id[!is.na(log10.BMD_spleen)])),
+  stomach = length(unique(dsstox_substance_id[!is.na(log10.BMD_stomach)])),
+  thyroid = length(unique(dsstox_substance_id[!is.na(log10.BMD_thyroid)]))
+)]
+
+datatable(number.chems.bmd.organ, 
+          filter='top', 
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+```
+
+* Now calculate the variance in BMDs.
+
+```{r, warning=FALSE}
+
+set.seed(123456789)
+
+varnames.bmd.organ <- names(data.bmd.organ.wide)[16:21] # columns of endpoint_target_group BMD names
+
+#unique(data.bmd.wide$species) rat, mouse, dog
+#unique(data.bmd.wide$study_type) SUB, CHR, SAC
+
+mlr.data.bmd.organ <- lapply(varnames.bmd.organ,
+                        FUN=function(x) lm(formula(paste(x,
+                        "~0+factor(dsstox_substance_id)+factor(study_type)+factor(species)+dose_spacing_center+dose_no+sub_purity_center+study_year_center")),
+                        data=data.bmd.organ.wide))
+
+
+```
+
+```{r, warning=FALSE}
+names(mlr.data.bmd.organ) <- varnames.bmd.organ
+                      
+#anova(mlr.data.full$kidney) # test to see how this worked
+
+# create a summary table of the ANOVA results for these MLR models by endpoint_target_group
+# likely a neater way to do this with tidyr but this was fast and straightforward
+
+variance.bmd.organ <- data.bmd.organ.wide[,list(
+  adrenal = round(var(log10.BMD_adrenal[!is.na(log10.BMD_adrenal)]),3),
+  kidney = round(var(log10.BMD_kidney[!is.na(log10.BMD_kidney)]),3),
+  liver = round(var(log10.BMD_liver[!is.na(log10.BMD_liver)]),3),
+  spleen = round(var(log10.BMD_spleen[!is.na(log10.BMD_spleen)]),3),
+  stomach = round(var(log10.BMD_stomach[!is.na(log10.BMD_stomach)]),3),
+  thyroid = round(var(log10.BMD_thyroid[!is.na(log10.BMD_thyroid)]),3)
+)]
+
+number.points.bmd.organ <- data.bmd.organ.wide[,list(
+  adrenal = length((log10.BMD_adrenal[!is.na(log10.BMD_adrenal)])),
+  kidney = length((log10.BMD_kidney[!is.na(log10.BMD_kidney)])),
+  liver = length((log10.BMD_liver[!is.na(log10.BMD_liver)])),
+  spleen = length((log10.BMD_spleen[!is.na(log10.BMD_spleen)])),
+  stomach = length((log10.BMD_stomach[!is.na(log10.BMD_stomach)])),
+  thyroid = length((log10.BMD_thyroid[!is.na(log10.BMD_thyroid)]))
+)]
+
+dat.res.bmd.organ <- as.data.table(cbind((t(number.chems.bmd.organ)), (t(number.points.bmd.organ)), (t(variance.bmd.organ))))
+
+setnames(dat.res.bmd.organ, c("V1", "V2", "V3"), c("Chemicals","N", "Var"))
+
+dat.res.bmd.organ$endpoint_target_group <- varnames.bmd.organ
+setcolorder(dat.res.bmd.organ, c(4,1:3))
+
+# MSE of LEL models 
+
+# function to calculate MSE (sum(residuals^2)/error degrees of freedom)
+
+mse_func <- function(model) {
+  round(glance(model)$deviance / model$df.residual, 3) ##broom::glance()
+}
+
+# apply mse and rmse functions to the model_list
+
+mod.res.bmd.organ <- mlr.data.bmd.organ %>% {
+  tibble(MSE = map_dbl(., mse_func)) } %>%
+  mutate(RMSE = round(sqrt(MSE), 3))
+
+bmd.organ.model.results <- bind_cols(dat.res.bmd.organ, mod.res.bmd.organ)
+
+# taking MSE as an estimated of unexplained variance, the total variance - unexplained divided by total should give the explained/total
+
+bmd.organ.model.results[,`% var explained` := round(((Var-MSE)/Var)*100,1)]
+
+# make a table of the values to summarize the models
+
+datatable(bmd.organ.model.results, 
+          filter='top', 
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+```
+
+* How different were BMDs from LELs?
+* First we need to match them by endpoint id or tg_effect_id.
+
+```{r, warning=FALSE}
+
+#colnames(data.bmd)
+#colnames(data.pod)
+
+data.bmd.organ$endpoint_id <- as.integer(data.bmd.organ$endpoint_id)
+
+data.bmd.organ$endpt.lel <- data.pod$endpt.lel[match(data.bmd.organ$endpoint_id,
+                                               data.pod$endpoint_id)]
+
+
+ggplot(data=data.bmd.organ)+
+  geom_point(aes(x=endpt.lel,y=log10.BMD))
+
+compare <- pod.tbl[tg_effect_id %in% data.bmd.organ[,tg_effect_id]]
+compare <- compare[treatment_related==1]
+compare <- compare[,.SD[which.min(dose_adjusted)], by=tg_effect_id]
+
+data.bmd.organ$min.dose.adjusted <- compare$dose_adjusted[match(data.bmd.organ$tg_effect_id, compare$tg_effect_id)]
+data.bmd.organ[,log10_min_dose_adjusted := log10(min.dose.adjusted)]
+```
+
+```{r, warning=FALSE, fig.width=12, fig.height=9}
+bmd.comp <- ggplot(data=data.bmd.organ, aes(x=log10_min_dose_adjusted, y=log10.BMD))+
+  geom_point(aes(x=log10_min_dose_adjusted,y=log10.BMD))+
+  theme_bw()+
+  theme(axis.text = element_text(size=14),
+        axis.title = element_text(size=16))+
+  scale_y_continuous(breaks=seq(-1,4,1))+
+  geom_smooth(method='lm',se=FALSE,color='blue',formula=y~x)+
+  stat_poly_eq(formula=y ~x,
+               eq.with.lhs = "italic(hat(y))~`=`~",
+               aes(label=paste(..eq.label.., ..rr.label.., sep ="~~~")),
+               parse=TRUE)+
+  xlab('LEL for tg_effect_id, log10-mg/kg/day')+
+  ylab('BMD for tg_effect_id, log10-mg/kg/day')+
+  facet_wrap(~endpoint_target_group)+
+  theme(strip.background = element_rect(color='black', fill='white', size=1),
+        strip.text = element_text(size=12, color='black', face='bold'))
+
+bmd.comp
+
+```
+
+```{r, warning=F, eval=F, echo=F}
+# export figure
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig_BMD_organ_summary_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=10000, height=6000, res=600)
+bmd.comp
+dev.off()
+
+```
+
+```{r,warning=FALSE}
+
+colnames(data.pod)
+
+```
+
+## MLR modeling for LELs that correspond to the BMD dataset
+
+```{r, warning=FALSE}
+
+
+pod.tbl3 <- pod.tbl[tg_effect_id %in% data.bmd.organ[,tg_effect_id]]
+
+# create the unique dataset
+
+data.pod.rev <- unique(pod.tbl3[,c('chemical_id',
+                              'dsstox_substance_id',
+                              'casrn',
+                              'preferred_name',
+                              'study_id',
+                              'study_type',
+                              'study_year',
+                              'study_source',
+                              'life_stage',
+                              'sex', # i was debating removing sex - left in for now. could remove later. sex will make it appear like there are two groups.
+                              'generation',
+                              'species',
+                              'strain_group',
+                              'admin_route',
+                              'admin_method',
+                              'substance_purity',
+                              'endpoint_id',
+                              'endpoint_target_group',
+                              'effect_desc_list',
+                              'study_count',
+                              'study_ids',
+                              'endpt.lel',
+                              'log_dose_adjusted_unit')])
+
+# need to understand dose-spacing, number of doses, and centered study year on a whole study basis. 
+# let's use the whole dataset to do this (go back to the "tbl" I had generated in H1)
+
+tbl[!is.na(dose_level), dose_no := max(dose_level, na.rm = TRUE) , by = study_id]
+tbl[dose_adjusted > 0, log_dose_adjusted := log10(dose_adjusted)]
+tbl[!is.na(log_dose_adjusted), ldt := min(log_dose_adjusted), by = study_id] #ldt = lowest dose tested in the study
+tbl[!is.na(log_dose_adjusted), hdt := max(log_dose_adjusted), by = study_id] #hdt = highest dose tested in the study
+tbl[ , dose_spacing := (hdt-ldt)/(dose_no-1)]
+
+# all of these values can be added to the dataset, keyed by study_id since they are calculated at the study_level
+data.pod.rev$ldt <- tbl$ldt[match(data.pod.rev$study_id,
+                              tbl$study_id)]
+data.pod.rev$hdt <- tbl$hdt[match(data.pod.rev$study_id,
+                              tbl$study_id)]
+data.pod.rev$dose_no <- tbl$dose_no[match(data.pod.rev$study_id,
+                                      tbl$study_id)]
+data.pod.rev$dose_spacing <- tbl$dose_spacing[match(data.pod.rev$study_id,
+                                      tbl$study_id)]
+
+is.na(data.pod.rev) <- do.call(cbind,lapply(data.pod.rev, is.infinite)) # make any Inf values into NA
+data.pod.rev$substance_purity <- as.numeric(data.pod.rev$substance_purity)
+
+# center these values for MLR testing, as done for Pham et al.
+mean.study.year <- round(mean(data.pod.rev$study_year, na.rm=TRUE),0) #1990
+mean.sub.pur <- round(mean(data.pod.rev$substance_purity, na.rm=TRUE),1) #94
+mean.dose.spacing <- round(mean(data.pod.rev$dose_spacing, na.rm=TRUE),1) #0.6
+
+data.pod.rev[is.na(study_year), study_year := mean.study.year]
+data.pod.rev[is.na(substance_purity), substance_purity := mean.sub.pur]
+data.pod.rev[is.na(dose_spacing), dose_spacing := mean.dose.spacing]
+
+data.pod.rev <- unique(data.pod.rev) %>%
+  .[ , sub_purity_center := substance_purity - mean.sub.pur] %>%
+  .[ , study_year_center := study_year - mean.study.year] %>% 
+  .[ , dose_spacing_center := dose_spacing - mean.dose.spacing]
+
+# cast the data wide so that each endpoint_target_group is a column
+# I cast this without sex with the assumption that the minimum for both sexes would be appropriate
+data.pod.rev.wide <- dcast.data.table(data.pod.rev,
+                                  chemical_id + dsstox_substance_id + casrn + preferred_name + study_id + study_type + study_source + life_stage
+                                  + generation + species + strain_group + admin_method + substance_purity + sub_purity_center +
+                                    study_year_center + dose_spacing_center + dose_no ~ endpoint_target_group,
+                                 value.var = c("endpt.lel"),
+                                 fun.aggregate = (min))
+
+is.na(data.pod.rev.wide) <- do.call(cbind,lapply(data.pod.rev.wide, is.infinite)) # replace Inf with NA
+setnames(data.pod.rev.wide, c('adrenal gland','thyroid gland'), c('adrenal','thyroid'))
+
+```
+
+* The number of substances by endpoint target group (organ)
+```{r, warning=FALSE}
+number.chems.rev <- data.pod.rev.wide[,list(
+  adrenal = length(unique(dsstox_substance_id[!is.na(adrenal)])),
+  kidney = length(unique(dsstox_substance_id[!is.na(kidney)])),
+  liver = length(unique(dsstox_substance_id[!is.na(liver)])),
+  spleen = length(unique(dsstox_substance_id[!is.na(spleen)])),
+  stomach = length(unique(dsstox_substance_id[!is.na(stomach)])),
+  thyroid = length(unique(dsstox_substance_id[!is.na(thyroid)]))
+)]
+
+datatable(number.chems.rev, 
+          filter='top', 
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+```
+
+```{r, warning=FALSE}
+
+set.seed(123456789)
+
+varnames <- names(data.pod.rev.wide)[18:23] # columns of endpoint_target_group names
+mlr.data.rev <- lapply(varnames,
+                        FUN=function(x) lm(formula(paste(x,
+                        "~0+factor(dsstox_substance_id)+factor(species)+factor(study_type)+dose_spacing_center+dose_no+study_year_center")),
+                        data=data.pod.wide))
+names(mlr.data.rev) <- varnames
+                      
+#anova(mlr.data.full$kidney) # test to see how this worked
+
+# create a summary table of the ANOVA results for these MLR models by endpoint_target_group
+# likely a neater way to do this with tidyr but this was fast and straightforward
+
+variance.rev <- data.pod.rev.wide[,list(
+  adrenal = round(var(adrenal[!is.na(adrenal)]),3),
+  kidney = round(var(kidney[!is.na(kidney)]),3),
+  liver = round(var(liver[!is.na(liver)]),3),
+  spleen = round(var(spleen[!is.na(spleen)]),3),
+  stomach = round(var(stomach[!is.na(stomach)]),3),
+  thyroid = round(var(thyroid[!is.na(thyroid)]),3)
+)]
+
+number.points.rev <- data.pod.rev.wide[,list(
+  adrenal = length((adrenal[!is.na(adrenal)])),
+  kidney = length((kidney[!is.na(kidney)])),
+  liver = length((liver[!is.na(liver)])),
+  spleen = length((spleen[!is.na(spleen)])),
+  stomach = length((stomach[!is.na(stomach)])),
+  thyroid = length((thyroid[!is.na(thyroid)]))
+)]
+
+dat.res.rev <- as.data.table(cbind((t(number.chems.rev)), (t(number.points.rev)), (t(variance.rev))))
+
+setnames(dat.res.rev, c("V1", "V2", "V3"), c("Chemicals","N", "Var"))
+
+dat.res.rev$endpoint_target_group <- varnames
+setcolorder(dat.res, c(4,1:3))
+
+# MSE of LEL models 
+
+# function to calculate MSE (sum(residuals^2)/error degrees of freedom)
+
+mse_func <- function(model) {
+  round(glance(model)$deviance / model$df.residual, 3) ##broom::glance()
+}
+
+# apply mse and rmse functions to the model_list
+
+mod.res <- mlr.data.rev %>% {
+  tibble(MSE = map_dbl(., mse_func)) } %>%
+  mutate(RMSE = round(sqrt(MSE), 3))
+
+lel.bmddata.model.results <- bind_cols(dat.res.rev, mod.res)
+
+# taking MSE as an estimated of unexplained variance, the total variance - unexplained divided by total should give the explained/total
+
+lel.bmddata.model.results[,`% var explained` := round(((Var-MSE)/Var)*100,1)]
+
+# make a table of the values to summarize the models
+
+datatable(lel.bmddata.model.results, 
+          filter='top', 
+          options=list(pagelength=25, autoWidth=FALSE,  scrollX=TRUE, initComplete = JS(
+    "function(settings, json) {",
+    "$('body').css({'font-family': 'Calibri'});",
+    "}"
+  )))
+
+```
+
+## Combined MLR Results
+
+
+```{r, warning=FALSE}
+
+lel.model.results[, Dataset := 'Full']
+lel.cur.model.results[, Dataset := 'Curated']
+bmd.organ.model.results[, Dataset := 'BMDs, organ']
+bmd.organ.model.results[endpoint_target_group=='log10.BMD_adrenal', endpoint_target_group := 'adrenal']
+bmd.organ.model.results[endpoint_target_group=='log10.BMD_kidney', endpoint_target_group := 'kidney']
+bmd.organ.model.results[endpoint_target_group=='log10.BMD_liver', endpoint_target_group := 'liver']
+bmd.organ.model.results[endpoint_target_group=='log10.BMD_spleen', endpoint_target_group := 'spleen']
+bmd.organ.model.results[endpoint_target_group=='log10.BMD_stomach', endpoint_target_group := 'stomach']
+bmd.organ.model.results[endpoint_target_group=='log10.BMD_thyroid', endpoint_target_group := 'thyroid']
+lel.bmddata.model.results[, Dataset := 'LELs for BMD Dataset']
+model.results.all <- rbind(lel.model.results, lel.cur.model.results, bmd.organ.model.results,lel.bmddata.model.results)
+
+model.results.all %>% kable() %>% kable_paper('hover',full_width=F)
+
+
+```
+
+
+
+
+```{r, warning=FALSE}
+
+model.results.all$graph.labels <- factor(model.results.all$Dataset, levels = c("Full", "Curated", "BMDs, organ", "LELs for BMD Dataset"))
+
+var.comp <- ggplot(model.results.all)+
+  geom_point(size=4, stroke=2, alpha=0.6, aes(x=endpoint_target_group, y=Var, shape=graph.labels, color=Chemicals))+
+  theme_bw(base_size=16)+
+  #labs(y= expression("Total Variance, (log10-mg/kg/day)"^2), x="Organ", color="# Chemicals", shape="Dataset")+
+  labs(x="")+
+  scale_color_viridis_b(end=.9)+
+  scale_shape_manual(values=c(8, 15,16,17,18,25))+
+  guides(shape = guide_legend(override.aes = list(size=3, stroke=1)))+
+  theme(axis.text = element_text(size=16), 
+        axis.title.x = element_text(size=16),
+        axis.text.x = element_text(angle=45, hjust=1),
+        axis.title.y = element_blank(),
+        legend.position = 'none')+
+  scale_y_continuous(breaks=seq(0,1.5,0.25))+
+  coord_cartesian(ylim=c(0,1.5))
+
+mse.comp <- ggplot(model.results.all)+
+  geom_point(size=4, stroke=2, alpha=0.6, aes(x=endpoint_target_group, y=MSE, shape=graph.labels, color=Chemicals))+
+  theme_bw(base_size=16)+
+  #labs(y= expression("Unexplained Variance, as MSE, (log10-mg/kg/day)"^2), x="Organ", color="# Chemicals", shape="Dataset")+
+  labs(x="", color="# Chemicals", shape="Dataset")+
+  scale_color_viridis_b(end=.9)+
+  scale_shape_manual(values=c(8, 15,16,17,18,25))+
+  guides(shape = guide_legend(override.aes = list(size=3, stroke=1)))+
+  theme(axis.text = element_text(size=16), 
+        axis.title.x = element_text(size=16),
+        axis.text.x = element_text(angle=45, hjust=1),
+        axis.title.y = element_blank())+
+  scale_y_continuous(breaks=seq(0,1.5,0.25))+
+  coord_cartesian(ylim=c(0,1.5))
+
+rmse.comp <- ggplot(model.results.all)+
+  geom_point(size=4, stroke=2, alpha=0.6, aes(x=endpoint_target_group, y=RMSE, shape=graph.labels, color=Chemicals))+
+  theme_bw(base_size=16)+
+  #labs(y= expression("RMSE (log10-mg/kg/day)"), x="Organ", color="# Chemicals", shape="Dataset")+
+  labs(x="", color="# Chemicals", shape="Dataset")+
+  scale_color_viridis_b(end=.9)+
+  scale_shape_manual(values=c(8, 15,16,17,18,25))+
+  guides(shape = guide_legend(override.aes = list(size=3, stroke=1)))+
+  theme(axis.text = element_text(size=16), 
+        axis.title.x = element_text(size=16),
+        axis.text.x = element_text(angle=45, hjust=1),
+        axis.title.y = element_blank(),
+        legend.position = 'none')+
+  scale_y_continuous(breaks=seq(0,1.5,0.25))+
+  coord_cartesian(ylim=c(0,1.5))
+
+varexp.comp <- ggplot(model.results.all)+
+  geom_point(size=4, stroke=2, alpha=0.6, aes(x=endpoint_target_group, y=`% var explained`, shape=graph.labels, color=Chemicals))+
+  theme_bw(base_size=16)+
+  #labs(y= expression("% variance explained"), x="Organ", color="# Chemicals", shape="Dataset")+
+  labs(x="", color="# Chemicals", shape="Dataset")+
+  scale_color_viridis_b(end=.9)+
+  scale_shape_manual(values=c(8, 15,16,17,18,25))+
+  guides(shape = guide_legend(override.aes = list(size=3, stroke=1)))+
+  theme(axis.text = element_text(size=16),
+        axis.text.x = element_text(angle=45, hjust=1),
+        axis.title.x = element_text(size=16),
+        axis.title.y = element_blank())+
+  coord_cartesian(ylim=c(0,100))
+
+```
+
+
+```{r, warning=F, message=F}
+
+bmd.model.results[, Dataset := 'BMDs, study']
+
+bmd.model.results
+
+```
+
+```{r, warning=FALSE}
+
+pham.lel.var.exp <- c(62.1, 62.7, 62.8, 69.0, 68.9, 62.7, 54.9)
+pham.lel.tot.var <- c(0.916, 0.908, 0.911, 0.842, 0.838, 0.858, 0.858)
+pham.lel.mse <- c(0.359, 0.347, 0.339, 0.339, 0.261, 0.261, 0.320, 0.387)
+pham.lel.rmse <- c(0.599, 0.589, 0.582, 0.582, 0.511, 0.511, 0.565, 0.622)
+N <- c(2724,2709,2721,2614,2603,278,278)
+Dataset <- c('MLR LEL, full dataset',
+             'MLR LEL, high leverage points removed',
+             'MLR LEL, high Cooks distance plot points removed',
+             'MLR LEL, high Cooks distance points removed',
+             'MLR LEL, all potential outliers removed',
+             'ACM LEL, full cell dataset',
+             'MLR LEL, full cell dataset')
+
+
+pham.lel.var.tbl <- data.table(
+                                  pham.lel.tot.var,
+                                  pham.lel.mse,
+                                  pham.lel.rmse,
+                                  pham.lel.var.exp,
+                                  N)
+
+setnames(pham.lel.var.tbl, c('pham.lel.tot.var',
+                                  'pham.lel.mse',
+                                  'pham.lel.rmse',
+                                  'pham.lel.var.exp'), c("Var", "MSE", "RMSE", "% var explained"))
+
+study.model.results <- merge.data.table(pham.lel.var.tbl,
+                                        bmd.model.results,
+                                        all.x=TRUE,
+                                        all.y = TRUE)
+
+study.model.results[c(1:8), Type := 'LELs']
+study.model.results[c(9), Type := 'BMDs']
+
+```
+
+```{r, warning=FALSE}
+
+pham.varexp.comp <- ggplot(study.model.results)+
+  geom_jitter(aes(x=Type, y=`% var explained`), alpha=0.6, color='black', size=3, width=0.1)+
+  geom_boxplot(aes(x=Type, y=`% var explained`))+
+  theme_bw(base_size=16)+
+  labs(y= expression("% variance explained"), x="")+
+  theme(axis.text = element_text(size=16), axis.title = element_text(size=16),
+        axis.text.x = element_text(angle=45, hjust=1))+
+  coord_cartesian(ylim=c(0,100))
+
+pham.mse.comp <- ggplot(study.model.results)+
+  geom_jitter(aes(x=Type, y=MSE), alpha=0.6, color='black', size=3, width=0.1)+
+  geom_boxplot(aes(x=Type, y=MSE))+
+  theme_bw(base_size=16)+
+  labs(y= expression("MSE (log10-mg/kg/day)"^2), x="")+
+  theme(axis.text = element_text(size=16), axis.title = element_text(size=16),
+        axis.text.x = element_text(angle=45, hjust=1))+
+  scale_y_continuous(breaks=seq(0,1.5,0.25))+
+  coord_cartesian(ylim=c(0,1.5))
+
+pham.tot.var.comp <- ggplot(study.model.results)+
+  geom_jitter(aes(x=Type, y=Var), alpha=0.6, color='black', size=3, width=0.1)+
+  geom_boxplot(aes(x=Type, y=Var))+
+  theme_bw(base_size=16)+
+  labs(y= expression("Total Variance, (log10-mg/kg/day)"^2), x="")+
+  theme(axis.text = element_text(size=16), axis.title = element_text(size=16),
+        axis.text.x = element_text(angle=45, hjust=1))+
+  scale_y_continuous(breaks=seq(0,1.5,0.25))+
+  coord_cartesian(ylim=c(0,1.5))
+
+pham.rmse.comp <- ggplot(study.model.results)+
+  geom_jitter(aes(x=Type, y=RMSE), alpha=0.6, color='black', size=3, width=0.1)+
+  geom_boxplot(aes(x=Type, y=RMSE))+
+  theme_bw(base_size=16)+
+  labs(y= expression("RMSE (log10-mg/kg/day)"), x="")+
+  theme(axis.text = element_text(size=16), axis.title = element_text(size=16),
+        axis.text.x = element_text(angle=45, hjust=1))+
+  scale_y_continuous(breaks=seq(0,1.5,0.25))+
+  coord_cartesian(ylim=c(0,1.5))
+
+
+```
+
+
+```{r, warning=FALSE, fig.height=12, fig.width=18}
+
+
+organ.var.multi <- plot_grid(pham.tot.var.comp, var.comp,
+                             pham.mse.comp, mse.comp,
+                             pham.rmse.comp, rmse.comp, 
+                             pham.varexp.comp, varexp.comp,
+                             nrow=2,
+                             ncol=4,
+                             rel_widths = c(0.25,0.78,
+                                            0.25,1.1,
+                                            0.25,0.78,
+                                            0.25,1.1),
+                            
+                             labels = c('A','',
+                                        'B','',
+                                        'C','',
+                                        'D',''),
+                             label_size = 18,
+                             align='hv',
+                             label_x=0.08,
+                             label_y = 0.98)
+
+
+
+organ.var.multi
+
+
+
+```
+
+```{r, warning=F, eval=F, echo=F}
+# export figure
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig_var_summary_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=10000, height=7000, res=600)
+organ.var.multi
+dev.off()
+
+```
+
+
+```{r, warning=FALSE, eval=FALSE}
+
+lel.var.results <- list("organ level variance results" = as.data.frame(model.results.all),
+                        "study level variance inc BMDs" = as.data.frame(study.model.results))
+
+write.xlsx(lel.var.results, file='./output/lel_var_results_summary_26Dec2022.xlsx')
+
+save(endpoints.pos,
+     tbl,
+     data.pod,
+     data.pod.cur,
+     data.pod.wide,
+     data.pod.cur.wide,
+     data.bmd.organ,
+     data.bmd.organ.wide,
+     data.bmd.study,
+     data.bmd.study.wide,
+     model.results.all,
+     study.model.results,
+     file='./source/endpoint_variance_estimation_26Dec2022.RData')
+
+
+data.mlr.var <- list("LEL by organ all" = as.data.frame(data.pod.wide),
+                     "LEL by organ curated" = as.data.frame(data.pod.cur.wide),
+                     "BMD by organ" = as.data.frame(data.bmd.organ.wide),
+                     "BMD by study" = as.data.frame(data.bmd.study.unique))
+
+write.xlsx(data.mlr.var, file='./source/Supp File 1 Input Data for MLR.xlsx')
+
+
+```
+
+
+# Part C: How similar are SUB and CHR findings? {.tabset .tabset-fade .tabset-pills}
+
+## Data cleaning
+
+* need to organize the data so we can match SUB and CHR studies per chemical
+* need to label the "negatives" that are inferred from the difference between positive and tested endpoints
+
+```{r cleaning full endpoint data, warning=F, message=F}
+
+#endpoints negative are defined as those endpoints in the full tested set that are not included in the positive set
+endpoints.neg<-subset(endpoints.tested, !(chem.study.endpt %in% endpoints.pos$chem.study.endpt)) # chem.study.endpt is a concatenation of dtxsid, study id, and endpoint id that allows matching of tested and positive
+
+#Making a binary outcome variable 0 or 1
+endpoints.neg$outcome <- 0
+endpoints.pos2 <- endpoints.pos
+endpoints.pos2$outcome <- 1
+
+#making sure the columns are the same in the positive and negative datasets 
+common2<-intersect(colnames(endpoints.neg), colnames(endpoints.pos2))
+epn2<-dplyr::select(endpoints.neg, all_of(common2))
+epp3<-dplyr::select(endpoints.pos2, all_of(common2))
+
+#combining positive and negative
+eps<-rbind(epn2, epp3)
+eps<-distinct(eps)
+
+#only interested in SUB or CHR studies
+eps<-subset(eps, study_type!="SAC")
+
+#table(eps$admin_route)
+
+# Feed        Oral Oral/Gavage 
+#  36      143348          76 
+
+table(eps$outcome)
+
+#     0      1 
+#136010   7094 
+
+# most outcomes are negative; only 5% percent positive
+
+#Sticking to Oral Studies
+#eps<-subset(eps, admin_route=="Oral") # feed, oral, and oral/gavage are all oral
+
+epsf<-eps %>%
+  mutate_if(sapply(eps, is.character), as.factor)
+
+#getting rid of duplicates
+epsf<-distinct(epsf)
+
+```
+
+### Grouping by substance, study_type, and organ
+
+```{r warning=F, message=F}
+#tallying the number of positive outcomes for each substance by organ by study
+ed<-epsf %>%
+  group_by(dsstox_substance_id, endpoint_target_group, study_type) %>%   tally(outcome)
+
+#replacing anything over 0 with 1 to indicate positive finding; more than 1 indicates more than one effect/study found a positive
+ed<-ed %>% 
+  mutate(n = case_when(n>0~1))
+ed<-ed %>% mutate(n = replace_na(n, 0))
+```
+
+### Grouping by substance, study_type, organ, and species
+
+```{r warning=F, message=F}
+
+#same as above but including species as well
+ed2<-epsf %>%
+  group_by(dsstox_substance_id, endpoint_target_group, study_type, species) %>% 
+  tally(outcome)
+
+ed2<-ed2 %>% 
+  mutate(n = case_when(n>0~1))
+ed2<-ed2 %>% mutate(n = replace_na(n, 0))
+```
+
+### Sample sizes for matched and unmatched data
+* Here matched and unmatched refer to having both SUB and CHR data for a given substance
+
+```{r warning=F, message=F}
+#list of substances that have CHR and SUB studies in rat
+ratboth<-intersect(subset(epsf, study_type=="CHR"&species=="rat")$dsstox_substance_id,subset(epsf,  study_type=="SUB"&species=="rat")$dsstox_substance_id)
+
+#list of substances that have CHR and SUB studies in mouse
+mouseboth<-intersect(subset(epsf, study_type=="CHR"&species=="mouse")$dsstox_substance_id,subset(epsf,  study_type=="SUB"&species=="mouse")$dsstox_substance_id)
+
+#list of substances that have CHR and SUB studies in dog
+dogboth<-intersect(subset(epsf, study_type=="CHR"&species=="dog")$dsstox_substance_id,subset(epsf,  study_type=="SUB"&species=="dog")$dsstox_substance_id)
+
+#list of substances that have CHR and SUB studies in both rat and mouse 
+rodentboth<-intersect(ratboth, mouseboth)
+
+#list of substances that have CHR and SUB studies in all three species
+allboth<-intersect(rodentboth, dogboth)
+
+
+#subsetting the grouped data to see if these chemicals were positive or negative
+edrb<-subset(ed, dsstox_substance_id %in% ratboth)
+edmb<-subset(ed, dsstox_substance_id %in% mouseboth)
+eddb<-subset(ed, dsstox_substance_id %in% dogboth)
+edrob<-subset(ed, dsstox_substance_id %in% rodentboth)
+edab<-subset(ed, dsstox_substance_id %in% allboth)
+
+#seeing how many substance each category had
+sample_sizes2by2 <- data.frame(c(uniqueN(edrb$dsstox_substance_id),uniqueN(subset(epsf,species=="rat")$dsstox_substance_id)),
+                               c(uniqueN(edmb$dsstox_substance_id),uniqueN(subset(epsf,species=="mouse")$dsstox_substance_id)),
+                               c(uniqueN(eddb$dsstox_substance_id),uniqueN(subset(epsf,species=="dog")$dsstox_substance_id)),
+                               c(uniqueN(edrob$dsstox_substance_id),uniqueN(subset(epsf,species=="rat"|species=="mouse")$dsstox_substance_id)),
+                               c(uniqueN(edab$dsstox_substance_id),uniqueN(epsf$dsstox_substance_id)))
+
+#formatting
+colnames(sample_sizes2by2)<-c("Rat","Mouse","Dog","Rodent","All")
+
+sample_sizes2by2<-t(sample_sizes2by2[2:1,])
+
+colnames(sample_sizes2by2)<-c("Unmatched, # Substances","Matched, # Substances")
+sample_sizes2by2 <- data.frame(sample_sizes2by2)
+datatable(sample_sizes2by2)
+
+```
+
+## Odds ratios with chemical matches {.tabset .tabset-fade .tabset-pills}
+
+Each chemical needs to have both study types for each species or species group.
+
+### Functions for calculating odds ratios
+
+```{r single species}
+#function that generates odds rations for each individual species y and for a certain organ x, will apply across all organs and species
+or_match<-function(x,y){
+  
+#finding the substances that have both study types in the same organ and species
+in1<-intersect(subset(ed2, study_type=="CHR"&endpoint_target_group == x&species==y)$dsstox_substance_id,subset(ed2,  study_type=="SUB"&endpoint_target_group == x&species==y)$dsstox_substance_id)
+
+#subsetting the data frame based on those substances
+in2<-subset(ed2, dsstox_substance_id %in% in1)
+#subsetting the data further based on the designated organ and species
+in3<-subset(in2, endpoint_target_group==x&species==y)
+
+#tallying the number of substance that fall into each category 
+
+#negative subchronic
+sub0<-subset(in3, n==0&study_type=="SUB")$dsstox_substance_id
+#positive subchronic
+sub1<-subset(in3, n==1&study_type=="SUB")$dsstox_substance_id
+#negative chronic
+chr0<-subset(in3, n==0&study_type=="CHR")$dsstox_substance_id
+#positive chronic
+chr1<-subset(in3, n==1&study_type=="CHR")$dsstox_substance_id
+
+#the intersection of the two is telling us what happened when the substance was testing in the other type of study
+sub0_chr1<-length(intersect(sub0,chr1))
+sub0_chr0<-length(intersect(sub0,chr0))
+sub1_chr0<-length(intersect(sub1,chr0))
+sub1_chr1<-length(intersect(sub1,chr1))
+
+#odds of positive in chr in sub positive
+odds1<-sub1_chr1/sub1_chr0
+#odds of positive in chr in sub negative
+odds0<-sub0_chr1/sub0_chr0
+
+#how much higher the odds of being positive in chr given you are positive in sub
+or<-odds1/odds0
+
+#standard error of the odds ratio
+se<-sqrt(1/(sub1_chr1+sub1_chr0+sub0_chr1+sub0_chr0))
+#lower bound on the confidence interval for the odds ratio
+low<-exp((log(or)-qnorm(.975)*se))
+#upper bound on the confidence interval
+up<-exp((log(or)+qnorm(.975)*se))
+#confidence interval
+ci<-c(low,up)
+#or and confidence interval
+c(or,ci)
+}
+
+#vector with all the organ names
+organs<-c("liver","kidney","adrenal gland","stomach","spleen","thyroid gland")
+#running the function across all the organs with rat
+rator_matched<-mapply(or_match, x=organs,MoreArgs = list(y = "rat"))
+#with dog
+dogor_matched<-mapply(or_match, x=organs,MoreArgs = list(y = "dog"))
+#with mouse
+mouseor_matched<-mapply(or_match, x=organs,MoreArgs = list(y = "mouse"))
+
+```
+
+```{r rodent}
+#function is essentially the same as above but instead of filtering by species i just filtered by what I know is in rodentboth, a vector that already contains all of the dtxsids of the substance I know have both study types in both rat and mouse
+or_match_rodent<-function(x){
+  in3<-subset(ed2, dsstox_substance_id %in% rodentboth)
+in3<-subset(in3, endpoint_target_group==x)
+
+sub0<-subset(in3, n==0&study_type=="SUB")$dsstox_substance_id
+sub1<-subset(in3, n==1&study_type=="SUB")$dsstox_substance_id
+chr0<-subset(in3, n==0&study_type=="CHR")$dsstox_substance_id
+chr1<-subset(in3, n==1&study_type=="CHR")$dsstox_substance_id
+
+sub0_chr1<-length(intersect(sub0,chr1))
+sub0_chr0<-length(intersect(sub0,chr0))
+sub1_chr0<-length(intersect(sub1,chr0))
+sub1_chr1<-length(intersect(sub1,chr1))
+
+odds1<-sub1_chr1/sub1_chr0
+odds0<-sub0_chr1/sub0_chr0
+or<-odds1/odds0
+se<-sqrt(1/(sub1_chr1+sub1_chr0+sub0_chr1+sub0_chr0))
+low<-exp((log(or)-qnorm(.975)*se))
+up<-exp((log(or)+qnorm(.975)*se))
+ci<-c(low,up)
+c(or,ci)
+
+}
+
+rodentor_matched<-sapply(organs, or_match_rodent)
+```
+
+```{r warning=F, message=F}
+#same as above but with all species in allboth, includes dog, rat, and mouse both SUB and CHR
+or_match_all<-function(x){
+  in3<-subset(ed2, dsstox_substance_id %in% allboth)
+in3<-subset(in3, endpoint_target_group==x)
+
+sub0<-subset(in3, n==0&study_type=="SUB")$dsstox_substance_id
+sub1<-subset(in3, n==1&study_type=="SUB")$dsstox_substance_id
+chr0<-subset(in3, n==0&study_type=="CHR")$dsstox_substance_id
+chr1<-subset(in3, n==1&study_type=="CHR")$dsstox_substance_id
+
+sub0_chr1<-length(intersect(sub0,chr1))
+sub0_chr0<-length(intersect(sub0,chr0))
+sub1_chr0<-length(intersect(sub1,chr0))
+sub1_chr1<-length(intersect(sub1,chr1))
+
+odds1<-sub1_chr1/sub1_chr0
+odds0<-sub0_chr1/sub0_chr0
+or<-odds1/odds0
+se<-sqrt(1/(sub1_chr1+sub1_chr0+sub0_chr1+sub0_chr0))
+low<-exp((log(or)-qnorm(.975)*se))
+up<-exp((log(or)+qnorm(.975)*se))
+ci<-c(low,up)
+c(or,ci)
+
+}
+
+allor_matched<-sapply(organs, or_match_all)
+
+```
+
+## Full Combined Dataframe
+
+* Odds ratios for CHR+ given SUB+ and CHR+ given SUB-
+
+```{r warning=F, message=F}
+#combining all the odds ratio data
+ors_matched<-data.frame(rbind(t(rator_matched),
+                              t(mouseor_matched),
+                              t(dogor_matched),
+                              t(rodentor_matched),
+                              t(allor_matched)))
+#getting rid of rownames
+rownames(ors_matched)<-NULL
+
+#properly naming columns
+colnames(ors_matched) <- c("Odds Ratio","Lower","Upper")
+
+#labeling organs
+ors_matched$organ<-rep(organs, 5)
+
+#labeling species
+ors_matched$species<-c(rep("Rat",6),rep("Mouse",6),rep("Dog",6),rep("Rodent",6),rep("All",6))
+
+#reshaping data frame
+ors_matchedM <- melt(ors_matched, id.vars=c("organ","species"))
+
+
+
+#rename value column and make inverse value
+ors_matchedM <- ors_matchedM %>%
+  rename("OR_CHR+_if_SUB+" = "value")
+
+ors_matchedM$`OR_CHR+_if_SUB+` <- round(ors_matchedM$`OR_CHR+_if_SUB+`, 3)
+
+ors_matchedM$`OR_CHR+_if_SUB-` <- 1/(ors_matchedM$`OR_CHR+_if_SUB+`)
+ors_matchedM$`OR_CHR+_if_SUB-` <- round(ors_matchedM$`OR_CHR+_if_SUB-`, 3)
+
+#column for organ species combination
+ors_matchedM$organ_species <- paste(ors_matchedM$organ, '|', tolower(ors_matchedM$species))
+
+
+datatable(ors_matchedM)
+```
+
+
+## Odds Ratio Figure
+```{r echo = T, warning=F, message=F, fig.height=8, fig.width=8}
+#positive plot using grid arrange to cut plot because of one group far off on x axis
+
+ors_matchedM$organ[ors_matchedM$organ=='adrenal gland'] <- "adrenal"
+ors_matchedM$organ[ors_matchedM$organ=='thyroid gland'] <- "thyroid"
+
+ors_matchedM <- as.data.table(ors_matchedM)
+orm_plot1 <- ggplot(ors_matchedM, aes(x=`OR_CHR+_if_SUB+`,y=organ_species,color=organ,shape=species))+
+  geom_point(data=ors_matchedM[variable=='Odds Ratio'],
+             aes(x=`OR_CHR+_if_SUB+`,y=organ_species),
+             size=2, stroke=1.5)+
+  #scale_color_viridis_d()+
+  scale_color_manual(values=c('#481567FF','#20A387FF','#33638DFF','#95D840FF', '#f9a242ff','#b8627dff'))+
+  geom_line()+
+  labs(x="Odds ratio of CHR+ given SUB+",y="Species x Organ")+
+  theme_bw()+
+  theme(text = element_text(size = 12), 
+        axis.text = element_text(size = 14), 
+        axis.title = element_text(size = 16),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        legend.position = 'none')+
+  geom_vline(xintercept = 1, size=.5, color="red",linetype="dashed")+
+  scale_shape_manual(values=c(8,17,18,25,5))+
+  scale_x_continuous(breaks=seq(1,12,1), limits=c(0,12.5))
+
+orm_plot1
+
+```
+
+```{r echo = T, results = 'hide', warning=F, message=F, fig.height=8, fig.width=8}
+
+
+#negative or inverse of that
+orm_plot2<-ggplot(ors_matchedM, aes(x=`OR_CHR+_if_SUB-`,
+                                    y=organ_species,color=organ,shape=species))+
+  #geom_point(size=2, stroke=1.5)+
+  geom_point(data=ors_matchedM[variable=='Odds Ratio'],
+             aes(x=`OR_CHR+_if_SUB-`,y=organ_species),
+             size=2, stroke=1.5)+
+  geom_line()+
+  #scale_color_viridis_d()+
+  scale_color_manual(values=c('#481567FF','#20A387FF','#33638DFF','#95D840FF', '#f9a242ff','#b8627dff'))+
+  labs(x="Odds ratio of CHR+ given SUB-",y="Species x Organ", color="Organ", shape="Species")+
+  theme_bw()+
+  theme(text = element_text(size = 12), 
+        axis.text = element_text(size = 14), 
+        axis.title = element_text(size = 16),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        legend.position = 'bottom')+
+  geom_vline(xintercept = 1, size=.5, color="red",linetype="dashed")+
+  scale_x_continuous(breaks=seq(0,1.1,0.2), limits=c(0, 1.1))+
+  scale_shape_manual(values=c(8,17,18,25,5))+
+  guides(shape = guide_legend(override.aes = list(size=2, stroke=1.5)))
+
+orm_plot2
+```
+
+```{r fig.height=12, fig.width=9, warning=F, message=F}
+orm1_2_merge <- plot_grid(orm_plot1, orm_plot2, labels = c('A','B'), label_size = 16, label_x=0.01,label_y = 0.99, nrow=2, rel_widths = c(1,1), rel_heights = c(1,1.2))
+orm1_2_merge
+
+```
+
+```{r, warning=F, eval=F, echo=F}
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig4_OR_CHR_SUB_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=5000, height=6000, res=600)
+orm1_2_merge
+dev.off()
+
+```
+
+
+#  Tables of sample sizes, proportions, and odds {.tabset .tabset-fade .tabset-pills}
+
+This section contains more detailed information on the counts of each organ and study type intersection, their proportions and the odds of occurrence.
+
+## Individual species function
+
+```{r warning=F, message=F}
+prop_match<-function(x,y){
+  #same exact subsetting procedure as above
+  in1<-intersect(subset(ed2, study_type=="CHR"&endpoint_target_group == x&species==y)$dsstox_substance_id,subset(ed2,  study_type=="SUB"&endpoint_target_group == x&species==y)$dsstox_substance_id)
+
+in2<-subset(ed2, dsstox_substance_id %in% in1)
+in3<-subset(in2, endpoint_target_group==x&species==y)
+
+sub0<-subset(in3, n==0&study_type=="SUB")$dsstox_substance_id
+sub1<-subset(in3, n==1&study_type=="SUB")$dsstox_substance_id
+chr0<-subset(in3, n==0&study_type=="CHR")$dsstox_substance_id
+chr1<-subset(in3, n==1&study_type=="CHR")$dsstox_substance_id
+
+sub0_chr1<-length(intersect(sub0,chr1))
+sub0_chr0<-length(intersect(sub0,chr0))
+sub1_chr0<-length(intersect(sub1,chr0))
+sub1_chr1<-length(intersect(sub1,chr1))
+
+#now we are totally the entire sample size 
+n <- uniqueN(c(sub0,sub1,chr1,chr0))
+
+#dividing by total n to get proportions 
+sub0_chr1p<-length(intersect(sub0,chr1))/n
+sub0_chr0p<-length(intersect(sub0,chr0))/n
+sub1_chr0p<-length(intersect(sub1,chr0))/n
+sub1_chr1p<-length(intersect(sub1,chr1))/n
+
+odds1<-sub1_chr1/sub1_chr0
+odds0<-sub0_chr1/sub0_chr0
+
+#outputting samples sizes, proportions, and then odds
+c(sub0_chr1,sub0_chr0,sub1_chr0,sub1_chr1,sub0_chr1p,sub0_chr0p,sub1_chr0p,sub1_chr1p, odds1, odds0)
+}
+```
+
+## Rat
+
+```{r warning=F, message=F}
+ratp_matched<-mapply(prop_match, x=organs,MoreArgs = list(y = "rat"))
+
+rownames(ratp_matched)<-c("sub0_chr1_n","sub0_chr0_n","sub1_chr0_n","sub1_chr1_n","sub0_chr1_p","sub0_chr0_p","sub1_chr0_p","sub1_chr1_p","Odds in SUB 1","Odds in SUB 0")
+
+ratp_matched<-data.frame(ratp_matched)
+ratp_matched
+```
+
+## Dog
+
+```{r warning=F, message=F}
+dogp_matched<-mapply(prop_match, x=organs,MoreArgs = list(y = "dog"))
+
+
+rownames(dogp_matched)<-c("sub0_chr1_n","sub0_chr0_n","sub1_chr0_n","sub1_chr1_n","sub0_chr1_p","sub0_chr0_p","sub1_chr0_p","sub1_chr1_p","Odds in SUB 1","Odds in SUB 0")
+
+dogp_matched<-data.frame(dogp_matched)
+dogp_matched
+```
+
+## Mouse
+```{r warning=F, message=F}
+
+mousep_matched<-mapply(prop_match, x=organs,MoreArgs = list(y = "mouse"))
+rownames(mousep_matched)<-c("sub0_chr1_n","sub0_chr0_n","sub1_chr0_n","sub1_chr1_n","sub0_chr1_p","sub0_chr0_p","sub1_chr0_p","sub1_chr1_p","Odds in SUB 1","Odds in SUB 0")
+
+mousep_matched<-data.frame(mousep_matched)
+mousep_matched
+```
+
+## Rodent
+
+```{r warning=F, message=F}
+prop_match2<-function(x){
+  #same exact subsetting procedure as above
+  in3<-subset(ed2, dsstox_substance_id %in% rodentboth)
+in3<-subset(in3, endpoint_target_group==x)
+
+sub0<-subset(in3, n==0&study_type=="SUB")$dsstox_substance_id
+sub1<-subset(in3, n==1&study_type=="SUB")$dsstox_substance_id
+chr0<-subset(in3, n==0&study_type=="CHR")$dsstox_substance_id
+chr1<-subset(in3, n==1&study_type=="CHR")$dsstox_substance_id
+
+sub0_chr1<-length(intersect(sub0,chr1))
+sub0_chr0<-length(intersect(sub0,chr0))
+sub1_chr0<-length(intersect(sub1,chr0))
+sub1_chr1<-length(intersect(sub1,chr1))
+
+#now we are totally the entire sample size 
+n <- uniqueN(c(sub0,sub1,chr1,chr0))
+
+#dividing by total n to get proportions 
+sub0_chr1p<-length(intersect(sub0,chr1))/n
+sub0_chr0p<-length(intersect(sub0,chr0))/n
+sub1_chr0p<-length(intersect(sub1,chr0))/n
+sub1_chr1p<-length(intersect(sub1,chr1))/n
+
+odds1<-sub1_chr1/sub1_chr0
+odds0<-sub0_chr1/sub0_chr0
+
+#outputting samples sizes, proportions, and then odds
+c(sub0_chr1,sub0_chr0,sub1_chr0,sub1_chr1,sub0_chr1p,sub0_chr0p,sub1_chr0p,sub1_chr1p, odds1, odds0)
+}
+
+#rodents and not individual species
+rodentp_matched<-sapply(organs,prop_match2)
+
+
+rownames(rodentp_matched)<-c("sub0_chr1_n","sub0_chr0_n","sub1_chr0_n","sub1_chr1_n","sub0_chr1_p","sub0_chr0_p","sub1_chr0_p","sub1_chr1_p","Odds in SUB 1","Odds in SUB 0")
+
+rodentp_matched<-data.frame(rodentp_matched)
+rodentp_matched
+```
+
+## All Species combined
+
+```{r warning=F, message=F}
+prop_match3<-function(x){
+  #same exact subsetting procedure as above
+  in3<-subset(ed2, dsstox_substance_id %in% allboth)
+in3<-subset(in3, endpoint_target_group==x)
+
+sub0<-subset(in3, n==0&study_type=="SUB")$dsstox_substance_id
+sub1<-subset(in3, n==1&study_type=="SUB")$dsstox_substance_id
+chr0<-subset(in3, n==0&study_type=="CHR")$dsstox_substance_id
+chr1<-subset(in3, n==1&study_type=="CHR")$dsstox_substance_id
+
+sub0_chr1<-length(intersect(sub0,chr1))
+sub0_chr0<-length(intersect(sub0,chr0))
+sub1_chr0<-length(intersect(sub1,chr0))
+sub1_chr1<-length(intersect(sub1,chr1))
+
+#now we are totally the entire sample size 
+n <- uniqueN(c(sub0,sub1,chr1,chr0))
+
+#dividing by total n to get proportions 
+sub0_chr1p<-length(intersect(sub0,chr1))/n
+sub0_chr0p<-length(intersect(sub0,chr0))/n
+sub1_chr0p<-length(intersect(sub1,chr0))/n
+sub1_chr1p<-length(intersect(sub1,chr1))/n
+
+odds1<-sub1_chr1/sub1_chr0
+odds0<-sub0_chr1/sub0_chr0
+
+#outputting samples sizes, proportions, and then odds
+c(sub0_chr1,sub0_chr0,sub1_chr0,sub1_chr1,sub0_chr1p,sub0_chr0p,sub1_chr0p,sub1_chr1p, odds1, odds0)
+}
+
+
+allp_matched<-sapply(organs,prop_match3)
+
+
+rownames(allp_matched)<-c("sub0_chr1_n","sub0_chr0_n","sub1_chr0_n","sub1_chr1_n","sub0_chr1_p","sub0_chr0_p","sub1_chr0_p","sub1_chr1_p","Odds in SUB 1","Odds in SUB 0")
+
+allp_matched<-data.frame(allp_matched)
+allp_matched
+```
+
+## Combined
+```{r warning=F, message=F}
+ratp_matched$Species<-"rat"
+dogp_matched$Species<-"dog"
+mousep_matched$Species<-"mouse"
+rodentp_matched$Species<-"rodent"
+allp_matched$Species<-"all"
+
+ratp_matched$reading<-rownames(ratp_matched)
+dogp_matched$reading<-rownames(dogp_matched)
+mousep_matched$reading<-rownames(mousep_matched)
+rodentp_matched$reading<-rownames(rodentp_matched)
+allp_matched$reading<-rownames(allp_matched)
+
+combop_matched<-data.frame(rbind(ratp_matched,dogp_matched,mousep_matched,rodentp_matched,allp_matched))
+rownames(combop_matched)<-NULL
+
+combo_frame<-melt(combop_matched, id.vars=c("reading","Species"))
+combo_frame2<-combo_frame %>% spread(reading, value)
+
+combo_frame2
+```
+
+
+```{r, warning=FALSE, eval=F}
+
+list_OR_data <- list("OR_sample_sizes" = as.data.frame(sample_sizes2by2),
+                          "endpt_outc_study&organ" = as.data.frame(ed),
+                          "endpt_outc_study&spec&organ" = as.data.frame(ed2),
+                          "endpt_outcomes_all" = as.data.frame(epsf),
+                          "OR_summary_plots"= as.data.frame(ors_matchedM),
+                     "OR_probs_all" = as.data.frame(combo_frame2),
+                     "probabilities_organ" = as.data.frame(probs_organ))
+
+write.xlsx(list_OR_data, file="./output/odds_ratio_results.xlsx")
+
+save(sample_sizes2by2,
+     ed,
+     ed2,
+     epsf,
+     ors_matchedM,
+     combo_frame2,
+     probs_organ,
+     file='./output/odds_ratio_results.RData')
+
+```
+
+
+# Paired randomization tests for LEL SUB vs CHR {.tabset .tabset-fade .tabset-pills}
+
+## Data subsetting
+* Need to look at the LELs by organ for chemicals with both CHR and SUB findings in the organ.
+* First, subset the data and find the overall N for this.
+
+```{r, warning=FALSE, message=FALSE}
+
+#subsetting positive endpoint data by organ and remove SAC due to not enough data for comparison
+
+liver2<-subset(endpoints.pos, endpoint_target_group=="liver" & study_type!="SAC")
+adrenal<-subset(endpoints.pos, endpoint_target_group=="adrenal gland" & study_type!="SAC")
+kidney<-subset(endpoints.pos, endpoint_target_group=="kidney" & study_type!="SAC")
+spleen<-subset(endpoints.pos, endpoint_target_group=="spleen" & study_type!="SAC")
+stomach<-subset(endpoints.pos, endpoint_target_group=="stomach" & study_type!="SAC")
+thyroid<-subset(endpoints.pos, endpoint_target_group=="thyroid gland" & study_type!="SAC")
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+## correcting LELs that appeared miscurated (ppm, not mg/kg/day) based on manual inspection of source files
+
+# col 27 is dose_adjusted
+kidney[which(kidney$study_id==3699), 27] <-kidney[which(kidney$study_id==3699), 27]*.05 # correction for ppm in diet to mg/kg/day for rats
+liver2[which(liver2$study_id==3699), 27] <-liver2[which(liver2$study_id==3699), 27]*.05 # correction for ppm in diet to mg/kg/day for rats
+spleen[which(spleen$study_id==3699), 27] <-spleen[which(spleen$study_id==3699), 27]*.05 # correction for ppm in diet to mg/kg/day for rats
+
+```
+
+```{r, warning=FALSE, messages=FALSE}
+options(dplyr.summarise.inform=FALSE)
+lelliver<-liver2 %>% 
+  group_by(study_type,dsstox_substance_id) %>% 
+  summarise(lel.mean=mean(dose_adjusted))
+
+lelkidney<-kidney %>% 
+  group_by(study_type,dsstox_substance_id) %>% 
+  summarise(lel.mean=mean(dose_adjusted))
+
+lelad<-adrenal %>% 
+  group_by(study_type,dsstox_substance_id) %>% 
+  summarise(lel.mean=mean(dose_adjusted))
+
+lelspleen<-spleen %>% 
+  group_by(study_type,dsstox_substance_id) %>% 
+  summarise(lel.mean=mean(dose_adjusted))
+
+lelst<-stomach %>% 
+  group_by(study_type,dsstox_substance_id) %>% 
+  summarise(lel.mean=mean(dose_adjusted))
+
+lelthy<-thyroid %>% 
+  group_by(study_type,dsstox_substance_id) %>% 
+  summarise(lel.mean=mean(dose_adjusted))
+
+```
+
+## Sample sizes
+
+```{r warning=F, message=F}
+lelliver_paired <- subset(lelliver, dsstox_substance_id %in% intersect(subset(lelliver, study_type=="CHR")$dsstox_substance_id,subset(lelliver, study_type=="SUB")$dsstox_substance_id))
+
+lelkidney_paired <- subset(lelkidney, dsstox_substance_id %in% intersect(subset(lelkidney, study_type=="CHR")$dsstox_substance_id,subset(lelkidney, study_type=="SUB")$dsstox_substance_id))
+
+lelad_paired <- subset(lelad, dsstox_substance_id %in% intersect(subset(lelad, study_type=="CHR")$dsstox_substance_id,subset(lelad, study_type=="SUB")$dsstox_substance_id))
+
+lelspleen_paired <- subset(lelspleen, dsstox_substance_id %in% intersect(subset(lelspleen, study_type=="CHR")$dsstox_substance_id,subset(lelspleen, study_type=="SUB")$dsstox_substance_id))
+
+lelst_paired <- subset(lelst, dsstox_substance_id %in% intersect(subset(lelst, study_type=="CHR")$dsstox_substance_id,subset(lelst, study_type=="SUB")$dsstox_substance_id))
+
+lelthy_paired <- subset(lelthy, dsstox_substance_id %in% intersect(subset(lelthy, study_type=="CHR")$dsstox_substance_id,subset(lelthy, study_type=="SUB")$dsstox_substance_id))
+
+samp_size_lel <- c(uniqueN(lelad$dsstox_substance_id),uniqueN(lelliver$dsstox_substance_id),uniqueN(lelkidney$dsstox_substance_id),uniqueN(lelspleen$dsstox_substance_id),uniqueN(lelst$dsstox_substance_id),uniqueN(lelthy$dsstox_substance_id))
+
+samp_size_lel_paired <- c(uniqueN(lelad_paired$dsstox_substance_id),uniqueN(lelliver_paired$dsstox_substance_id),uniqueN(lelkidney_paired$dsstox_substance_id),uniqueN(lelspleen_paired$dsstox_substance_id),uniqueN(lelst_paired$dsstox_substance_id),uniqueN(lelthy_paired$dsstox_substance_id))
+
+lel_ss <- data.frame(samp_size_lel,samp_size_lel_paired) # here paired means CHR and SUB study avail
+lel_ss$Organ<-c("Adrenal","Liver","Kidney","Spleen","Stomach","Thyroid")
+lel_ss[,c(3,1,2)]
+```
+
+
+## Paired log raw data plots
+
+```{r warning=F, message=F, fig.height=8, fig.width=12}
+
+lel_paired_raw_plot<-function(data,x){
+
+c<-subset(data, study_type=="CHR")
+s<-subset(data, study_type=="SUB")
+
+c<-arrange(c, dsstox_substance_id)
+s<-arrange(s, dsstox_substance_id)  
+
+difs<-log10(c$lel.mean)-log10(s$lel.mean)
+difs2<-data.frame(difs)
+
+p<-ggplot(difs2, aes(x=difs))+geom_histogram(alpha=.6, bins=x)+
+  #labs(x="CHR - SUB Log10 Dose mg/kg/day", y="Number of Substances")+
+  theme_bw(base_size = 14)+
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+  
+p
+}
+
+pair1<-lel_paired_raw_plot(lelliver_paired,40)
+pair2<-lel_paired_raw_plot(lelkidney_paired,40)
+pair3<-lel_paired_raw_plot(lelad_paired,20)
+pair4<-lel_paired_raw_plot(lelspleen_paired,20)
+pair5<-lel_paired_raw_plot(lelst_paired,10)
+pair6<-lel_paired_raw_plot(lelthy_paired,10)
+
+pair1<-pair1+labs(title="Liver") + ylim(0,25) + scale_x_continuous(breaks=seq(-3,3,1), limits=c(-3,3))
+pair2<-pair2+labs(title="Kidney") + ylim(0,25) + scale_x_continuous(breaks=seq(-3,3,1), limits=c(-3,3))
+pair3<-pair3+labs(title="Adrenal") + ylim(0,25) + scale_x_continuous(breaks=seq(-3,3,1), limits=c(-3,3))
+pair4<-pair4+labs(title="Spleen") + ylim(0,25) + scale_x_continuous(breaks=seq(-3,3,1), limits=c(-3,3))
+pair5<-pair5+labs(title="Stomach") + ylim(0,25) + scale_x_continuous(breaks=seq(-3,3,1), limits=c(-3,3))
+pair6<-pair6+labs(title="Thyroid") + ylim(0,25) + scale_x_continuous(breaks=seq(-3,3,1), limits=c(-3,3))
+
+pair_combo <- grid.arrange(pair3,pair1,
+                        pair2, pair4, pair5,pair6,
+                        nrow=2,
+                        ncol=3,
+                        bottom = textGrob(
+                          'CHR - SUB, log10-mg/kg/day',
+                          gp = gpar(fontsize=18)
+                        ),
+                        left = textGrob(
+                          'Number of Substances',
+                          gp = gpar(fontsize=18),
+                          rot=90
+                        )
+                        )
+
+grid.draw(pair_combo)
+```
+
+
+## Paired p-values and confidence intervals
+
+```{r warning=F, message=F}
+
+lel_paired_p<-function(data, reps, seed){
+
+c<-subset(data, study_type=="CHR")
+s<-subset(data, study_type=="SUB")
+
+c<-arrange(c, dsstox_substance_id)
+s<-arrange(s, dsstox_substance_id)  
+
+difs<-log10(c$lel.mean)-log10(s$lel.mean)
+  #setting seed
+  set.seed(seed)
+  #mean of sample data
+xbar<-mean(difs)
+#setting number of replications
+resamples<-reps
+#creating a dataset to store the null data
+nulldist<-rep(12345, resamples)
+#size of original data
+n<-length(difs)
+
+#running the resampling, basically switching the signs on the original data mixes up the group labeling creating however many number of null distributions of size n we choose, then taking the mean of those
+for(i in 1:resamples){
+     signs <- sample(c(1,-1),size = n, replace = TRUE)
+    simdiffs<- signs*difs
+    nulldist[i] <- mean(simdiffs)
+}
+
+#data frame of null means
+nulldist<-data.frame(nulldist)
+#how many times is the null mean as or more extreme than the observed mean?
+lowtail<-(sum(nulldist <= xbar)+1)
+uptail<-(sum(nulldist >= xbar)+1)
+
+#taking the minimum, two sided test
+num<-min(lowtail,uptail)
+#total number of chances
+denom<-resamples+1
+#p-value multiplied by two because its a two sided test
+p<- (2 * (num/denom))
+#standard error
+se<-sd(nulldist$nulldist)
+#upper confidence bound
+upci<-xbar+(qnorm(.975)*se)
+#lower confidence bound
+lowci<-xbar-(qnorm(.975)*se)
+#the outcomes
+outy<-data.frame(p,xbar,upci,lowci)
+colnames(outy)<-c("P-value","Mean","Upper CI","Lower CI")
+outy
+}
+
+liv_lel_paired<-lel_paired_p(lelliver_paired, 100000, 123)
+kid_lel_paired<-lel_paired_p(lelkidney_paired, 100000, 123)
+ad_lel_paired<-lel_paired_p(lelad_paired, 100000, 123)
+spl_lel_paired<-lel_paired_p(lelspleen_paired, 100000, 123)
+st_lel_paired<-lel_paired_p(lelst_paired, 100000, 123)
+thy_lel_paired<-lel_paired_p(lelthy_paired, 100000, 123)
+
+paired_lel_pvalues<-round(data.frame(rbind(ad_lel_paired,liv_lel_paired,kid_lel_paired,spl_lel_paired,st_lel_paired,thy_lel_paired)),4)
+paired_lel_pvalues$Organ<-c("Adrenal","Liver","Kidney","Spleen","Stomach","Thyroid")
+paired_lel_pvalues[,c(5,2,3,4,1)]
+
+
+```
+
+
+```{r, warning=FALSE, eval=FALSE}
+
+
+paired_lel_results <- merge(lel_ss, paired_lel_pvalues, by='Organ')
+
+write.csv(paired_lel_results, file='./output/paired_CHR_SUB_diff_pvalues_ss.csv')
+
+
+```
+
+
+## Paired randomization plots
+
+```{r}
+lel_paired_plot<-function(data, reps, seed){
+
+c<-subset(data, study_type=="CHR")
+s<-subset(data, study_type=="SUB")
+
+c<-arrange(c, dsstox_substance_id)
+s<-arrange(s, dsstox_substance_id)  
+
+difs<-log10(c$lel.mean)-log10(s$lel.mean)
+  #setting seed
+  set.seed(seed)
+  #mean of sample data
+xbar<-mean(difs)
+#setting number of replications
+resamples<-reps
+#creating a dataset to store the null data
+nulldist<-rep(12345, resamples)
+#size of original data
+n<-length(difs)
+
+#running the resampling, basically switching the signs on the original data mixes up the group labeling creating however many number of null distributions of size n we choose, then taking the mean of those
+for(i in 1:resamples){
+     signs <- sample(c(1,-1),size = n, replace = TRUE)
+    simdiffs<- signs*difs
+    nulldist[i] <- mean(simdiffs)
+}
+
+#data frame of null means
+nulldist<-data.frame(nulldist)
+#how many times is the null mean as or more extreme than the observed mean?
+lowtail<-(sum(nulldist <= xbar)+1)
+uptail<-(sum(nulldist >= xbar)+1)
+
+#taking the minimum, two sided test
+num<-min(lowtail,uptail)
+#total number of chances
+denom<-resamples+1
+#p-value multiplied by two because its a two sided test
+p<- (2 * (num/denom))
+#standard error
+se<-sd(nulldist$nulldist)
+#upper confidence bound
+upci<-xbar+(qnorm(.975)*se)
+#lower confidence bound
+lowci<-xbar-(qnorm(.975)*se)
+#the outcomes
+ggplot(nulldist, aes(x=nulldist))+
+  geom_density()+geom_vline(xintercept = xbar, color="red")+
+  geom_vline(xintercept = upci, color="red", linetype="dashed")+
+  geom_vline(xintercept = lowci, color="red", linetype="dashed")+
+  theme_bw(base_size = 14)+
+  labs(y="", x="")
+}
+
+lp1<-lel_paired_plot(lelliver_paired, 100000, 123)
+lp2<-lel_paired_plot(lelkidney_paired, 100000, 123)
+lp3<-lel_paired_plot(lelad_paired, 100000, 123)
+lp4<-lel_paired_plot(lelspleen_paired, 100000, 123)
+lp5<-lel_paired_plot(lelst_paired, 100000, 123)
+lp6<-lel_paired_plot(lelthy_paired, 100000, 123)
+
+lp1<-lp1 + labs(title="Liver")+ylim(0,12.5) + xlim(-0.6, 0.6)
+lp2<-lp2+labs(title="Kidney")+ylim(0,12.5) + xlim(-0.6, 0.6)
+lp3<-lp3+labs(title="Adrenal")+ylim(0,12.5) + xlim(-0.6, 0.6)
+lp4<-lp4+labs(title="Spleen")+ylim(0,12.5) + xlim(-0.6, 0.6)
+lp5<-lp5+labs(title="Stomach")+ylim(0,12.5) + xlim(-0.6, 0.6)
+lp6<-lp6+labs(title="Thyroid")+ylim(0,12.5) + xlim(-0.6, 0.6)
+
+```
+
+
+```{r, warning=FALSE, message=FALSE, fig.height=8, fig.width=12}
+
+
+lelpairedplot <- grid.arrange(lp3,lp1,lp2,lp4,lp5,lp6,
+                        nrow=2,
+                        ncol=3,
+                        #top = textGrob(
+                        #  'Paired Log10 LEL Randomization Distributions',
+                        #  gp = gpar(fontsize=14)
+                        #),
+                        left = textGrob(
+                          'Density',
+                          gp = gpar(fontsize=18),
+                          rot=90
+                        ),
+                        bottom = textGrob(
+                          'Null Mean Differences, log10-mg/kg/day',
+                          gp = gpar(fontsize=18)
+                        )
+                        )
+
+grid.draw(lelpairedplot)
+
+
+#lelpairedplot<-ggarrange(lp1+rremove("xlab")+rremove("ylab"),lp2+rremove("xlab")+rremove("ylab"),lp3+rremove("xlab")+rremove("ylab"),lp4+rremove("xlab")+rremove("ylab"),lp5+rremove(#"xlab")+rremove("ylab"),lp6+rremove("xlab")+rremove("ylab"), common.legend =T)
+
+#annotate_figure(lelpairedplot, top = text_grob("Paired Log10 LEL Randomization Distributions", face = "bold", size=20),left = textGrob("Density", rot = 90, vjust = 1, gp = gpar(cex #= 1.7)),
+#                    bottom = textGrob("Distribution of Null Mean Differences (CHR - SUB)", gp = gpar(cex= 1.7)))
+
+
+
+```
+
+```{r, warning=F, eval=F, echo=F}
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig_paired_CHR_SUB_diff_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=6000, height=4000, res=600)
+grid.draw(lelpairedplot)
+dev.off()
+
+```
+
+```{r, warning=FALSE, eval=FALSE, fig.width=12, fig.height=16}
+
+chr.sub.diff.all <- plot_grid(pair_combo,
+                              lelpairedplot,
+                             nrow=2,
+                             ncol=1,
+                             labels = c('A','B'),
+                             label_size = 18)
+                             #align='hv',
+                             #label_x=0.08,
+                             #label_y = 0.98)
+
+
+
+chr.sub.diff.all
+
+```
+
+```{r, warning=F, eval=F, echo=F}
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig_CHR_SUB_paired_raw_random_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=6000, height=8000, res=600)
+grid.draw(chr.sub.diff.all)
+dev.off()
+
+```
+
+
+# Part D: LEL vs AED values, Data Cleaning {.tabset .tabset-fade .tabset-pills}  
+
+## Invitrodb version 3.5
+
+Set up connections to database.
+
+```{r, warning=FALSE, echo=FALSE, eval=FALSE}
+
+con2 <- dbConnect(drv = RMySQL::MySQL(), user="", #fill user
+                 password = "", # fill pass
+                 host = "", database = prod_internal_invitrodb_v3_5)
+
+tcplConf(user='', pass='', db='prod_internal_invitrodb_v3_5', drvr='MySQL', host='') 
+
+```
+
+```{r, warning=FALSE}
+
+load(file='./source/invitrodb_v3_5_mc5_data.RData')
+
+```
+
+
+Get assay component endpoint table.
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+
+ace <- dbGetQuery(con2, 'SELECT * FROM prod_internal_invitrodb_v3_5.assay INNER JOIN
+                  prod_internal_invitrodb_v3_5.assay_component ON assay.aid = assay_component.aid INNER JOIN prod_internal_invitrodb_v3_5.assay_component_endpoint ON assay_component.acid=assay_component_endpoint.acid;') %>% data.table()
+
+```
+
+## Liver
+
+* Using expert judgement, LTEA and ATG_CIS and ATG_TRANS are likely the best assay suites to indicate liver function and health.
+* APR (high content imaging) and others may be also be useful.
+
+```{r, warning=FALSE, eval=FALSE}
+
+#datatable(unique(ace[tissue %in% 'liver' & cell_format %in% c('cell line','primary cell'), c('aid','assay_name','tissue','organism','cell_format','cell_free_component_source','cell_short_name')]))
+
+liver.aeid <- ace[tissue %in% 'liver' & cell_format %in% c('cell line','primary cell') & aid %in% c(2:6, 371, 399:401)]
+
+```
+
+```{r, warning=FALSE}
+datatable(liver.aeid[,c('aid','assay_name','tissue','organism','cell_format','cell_free_component_source','cell_short_name')])
+```
+
+```{r, warning=FALSE, eval=FALSE}
+
+mc5 <- tcplPrepOtpt(tcplSubsetChid(tcplLoadData(lvl=5, fld='aeid', val=liver.aeid[,aeid], type='mc')))
+mc6 <- tcplPrepOtpt(tcplLoadData(lvl=6, fld='m4id', val=mc5$m4id, type='mc'))
+setDT(mc6)
+mc6_mthds <- mc6[ , .( mc6_mthd_id = paste(mc6_mthd_id, collapse=",")), by = m4id]
+mc6_flags <- mc6[ , .( flag = paste(flag, collapse=";")), by = m4id]
+mc5$mc6_flags <- mc6_mthds$mc6_mthd_id[match(mc5$m4id, mc6_mthds$m4id)]
+mc5[, flag.length := ifelse(!is.na(mc6_flags), count.fields(textConnection(mc6_flags), sep =','), NA)]
+
+# filter the dataset, with coarse filters
+mc5[hitc==1 & flag.length < 3, use.me := 1]
+mc5[hitc==1 & is.na(flag.length), use.me := 1]
+mc5[hitc==1 & flag.length >= 3, use.me := 0]
+mc5[fitc %in% c(36,45), use.me := 0]
+mc5[hitc==-1, use.me := 0] # make hitc interpretable as a positive sum
+mc5[use.me==0, modl_ga := as.numeric(NA)]
+mc5[use.me==0, hitc := 0]
+mc5[hitc==0, modl_ga := as.numeric(NA)]
+
+mc5[hitc==1,ac50_uM := ifelse(!is.na(modl_ga), 10^modl_ga, NA)]
+
+mc5.liver <- as.data.table(mc5)
+
+```
+
+## Kidney
+
+```{r, warning=FALSE, eval=FALSE}
+
+kidney.aeid <- ace[tissue %in% 'kidney' & intended_target_family=='cell cycle']
+
+```
+
+```{r, warning=FALSE}
+
+datatable(kidney.aeid[,c('aeid','assay_component_endpoint_name','tissue','organism','cell_format','cell_free_component_source','cell_short_name', 'intended_target_family')])
+
+
+```
+
+* Cell viability assays in HEK293T cells seem the best option to represent kidney health.
+* Many assays contain transfected/transduced reporters, and so these reporter assays would not be a good indicator of kidney health.
+
+```{r, warning=FALSE, eval=FALSE}
+
+mc5 <- tcplPrepOtpt(tcplSubsetChid(tcplLoadData(lvl=5, fld='aeid', val=kidney.aeid[,aeid], type='mc')))
+mc6 <- tcplPrepOtpt(tcplLoadData(lvl=6, fld='m4id', val=mc5$m4id, type='mc'))
+setDT(mc6)
+mc6_mthds <- mc6[ , .( mc6_mthd_id = paste(mc6_mthd_id, collapse=",")), by = m4id]
+mc6_flags <- mc6[ , .( flag = paste(flag, collapse=";")), by = m4id]
+mc5$mc6_flags <- mc6_mthds$mc6_mthd_id[match(mc5$m4id, mc6_mthds$m4id)]
+mc5[, flag.length := ifelse(!is.na(mc6_flags), count.fields(textConnection(mc6_flags), sep =','), NA)]
+
+# filter the dataset, with coarse filters
+mc5[hitc==1 & flag.length < 3, use.me := 1]
+mc5[hitc==1 & is.na(flag.length), use.me := 1]
+mc5[hitc==1 & flag.length >= 3, use.me := 0]
+mc5[fitc %in% c(36,45), use.me := 0]
+mc5[hitc==-1, use.me := 0] # make hitc interpretable as a positive sum
+mc5[use.me==0, modl_ga := as.numeric(NA)]
+mc5[use.me==0, hitc := 0]
+mc5[hitc==0, modl_ga := as.numeric(NA)]
+
+mc5[hitc==1,ac50_uM := ifelse(!is.na(modl_ga), 10^modl_ga, NA)]
+
+mc5.kidney <- as.data.table(mc5)
+
+```
+
+
+```{r, warning=FALSE, eval=FALSE}
+
+save(mc5.liver,
+     mc5.kidney,
+     liver.aeid,
+     kidney.aeid,
+     ace,
+     file='./source/invitrodb_v3_5_mc5_data.RData')
+
+```
+
+```{r, warning=FALSE, message=FALSE, include=FALSE, eval=FALSE}
+
+load('./source/invitrodb_v3_5_mc5_data.RData')
+
+
+```
+
+## Summarize the mc5 data
+
+```{r, warning=FALSE, eval=FALSE}
+
+mc5.liver[, organ := 'liver']
+mc5.kidney[, organ := 'kidney']
+
+mc5.dt <- rbind(mc5.liver, mc5.kidney)
+
+setnames(mc5.dt, c('dsstox_substance_id.x'), c('dsstox_substance_id'))
+mc5.dt[, c('dsstox_substance_id.y') := NULL]
+```
+
+```{r, warning=FALSE, eval=FALSE}
+
+mc5.dt.summary <- mc5.dt[,list(
+  p5.ac50uM = quantile(ac50_uM, probs=c(0.05), na.rm=T),
+  p50.ac50uM = quantile(ac50_uM, probs=c(0.50), na.rm=T),
+  mean.ac50uM = mean(ac50_uM, na.rm=T)), 
+  by = list(organ, dsstox_substance_id, chnm, casn)]
+
+mc5.dt.summary[, names(mc5.dt.summary) := lapply(.SD, function(x) ifelse(is.nan(x), NA, x))]
+
+mc5.dt.httk <- mc5.dt.summary[!is.na(mean.ac50uM)]
+
+```
+
+* Move to library(httk) to understand how many chemicals we can calculate AED for.
+* Load datasets to use in silico Clint and Fup estimates.
+
+```{r, warning=FALSE, messages=FALSE, eval=FALSE}
+load_sipes2017()
+load_dawson2021()
+load_pradeep2020()
+
+```
+
+```{r, warning=FALSE, eval=FALSE}
+
+mc5.df <- as.data.frame(subset(mc5.dt.httk, casn %in% get_cheminfo(species='Human', model='pbtk')))
+length(unique(mc5.df$dsstox_substance_id)) #4107
+
+mc5.dt.httk2 <- subset(mc5.dt.httk, casn %in% get_cheminfo(species='Human', model='3compartmentss'))
+length(unique(mc5.dt.httk2$dsstox_substance_id)) #4143
+```
+* Reduce the dataset down to the chemicals with in vivo data.
+
+```{r, warning=FALSE, eval=FALSE}
+
+liver.dtxsid <- unique(liver2$dsstox_substance_id) #464
+kidney.dtxsid <- unique(kidney$dsstox_substance_id) #388
+
+mc5.dt.httk.liv <- mc5.dt.httk2[organ=='liver' & dsstox_substance_id %in% liver.dtxsid]
+length(unique(mc5.dt.httk.liv$dsstox_substance_id)) #365
+
+mc5.dt.httk.kid <- mc5.dt.httk2[organ=='kidney' & dsstox_substance_id %in% kidney.dtxsid]
+length(unique(mc5.dt.httk.kid$dsstox_substance_id)) #194
+
+mc5.df <- rbind(mc5.dt.httk.liv, mc5.dt.httk.kid) %>% as.data.frame()
+head(mc5.df)
+
+```
+
+```{r, warning=FALSE, eval=FALSE}
+
+toxcast_data <- list("mc5 summary" = mc5.df,
+                     "kidney assays used" = as.data.frame(kidney.aeid),
+                     "liver assays used" = as.data.frame(liver.aeid))
+
+write.xlsx(toxcast_data, file='./output/mc5_summary_data_used.xlsx')
+
+
+```
+
+## Generate AEDs
+
+```{r, warning=FALSE, eval=FALSE}
+aed.hu.css.df=data.frame()
+for (i in 1:nrow (mc5.df))
+{
+
+  aed.p5ac50.hu.css.50 <-(calc_mc_oral_equiv(conc=mc5.df$p5.ac50uM[i], 
+                                     dtxsid = mc5.df$dsstox_substance_id[i], 
+                                     which.quantile=c(0.50),
+                                     species='Human',
+                                     restrictive.clearance=T, 
+                                     output.units='mgpkgpday',
+                                     model='3compartmentss'))
+  
+  
+  aed.p50ac50.hu.css.50 <-(calc_mc_oral_equiv(conc=mc5.df$p50.ac50uM[i], 
+                                     dtxsid = mc5.df$dsstox_substance_id[i], 
+                                     which.quantile=c(0.50),
+                                     species='Human',
+                                     restrictive.clearance=T, 
+                                     output.units='mgpkgpday',
+                                     model='3compartmentss'))
+    
+  aed.meanac50.hu.css.50 <-(calc_mc_oral_equiv(conc=mc5.df$mean.ac50uM[i], 
+                                     dtxsid = mc5.df$dsstox_substance_id[i], 
+                                     which.quantile=c(0.50),
+                                     species='Human',
+                                     restrictive.clearance=T, 
+                                     output.units='mgpkgpday',
+                                     model='3compartmentss'))
+  
+  
+  aed.hu.css.df<-rbind(aed.hu.css.df,
+                     cbind(
+                           mc5.df$dsstox_substance_id[i], 
+                           mc5.df$casn[i],
+                           mc5.df$chnm[i],
+                           mc5.df$p5.ac50uM[i], 
+                           mc5.df$p50.ac50uM[i],
+                           mc5.df$mean.ac50uM[i],
+                           mc5.df$organ[i],
+                           aed.p5ac50.hu.css.50,
+                           aed.p50ac50.hu.css.50,
+                           aed.meanac50.hu.css.50))
+}
+
+
+```
+
+```{r,warning=FALSE, eval=FALSE}
+
+aed.hu.css.dt <- as.data.table(aed.hu.css.df)
+
+setnames(aed.hu.css.dt,
+         c('V1','V2','V3','V4', 'V5', 'V6', 'V7'),
+         c('dsstox_substance_id','casn','chnm', 'p5.ac50uM', 'p50.ac50uM', 'mean.ac50uM', 'organ'))
+
+col.num <- c('p5.ac50uM', 'p50.ac50uM', 'mean.ac50uM', 'aed.p5ac50.hu.css.50', 'aed.p50ac50.hu.css.50','aed.meanac50.hu.css.50')
+aed.hu.css.dt[, (col.num) := lapply (.SD, as.numeric), .SDcols = col.num ]
+aed.hu.css.dt <-aed.hu.css.dt[order(-aed.p5ac50.hu.css.50)]
+head(aed.hu.css.dt)
+
+```
+
+```{r, warning=FALSE, eval=FALSE}
+
+save(aed.hu.css.dt,
+     file='./output/aed_from_hu_httk_3css_4Feb2022.RData')
+```
+
+```{r, warning=FALSE}
+
+load('./output/aed_from_hu_httk_3css_4Feb2022.RData')
+
+aed.hu.css.dt <- aed.hu.css.dt[!aed.p5ac50.hu.css.50=='Inf']
+liv_dose_aed<-subset(aed.hu.css.dt, organ=='liver')
+kid_dose_aed<-subset(aed.hu.css.dt, organ=='kidney')
+
+```
+
+## Prepare LEL to AED comparisons
+
+* Take min in vivo LEL by organ and dtxsid.
+
+```{r, warning=FALSE, message=FALSE}
+
+options(dplyr.summarise.inform=FALSE)
+
+lelliver2<-liver2 %>% 
+  group_by(dsstox_substance_id) %>% 
+  summarise(min_lel=min(log10(dose_adjusted)))
+
+lelkidney2<-kidney %>% 
+  group_by(dsstox_substance_id) %>% 
+  summarise(min_lel=min(log10(dose_adjusted)))
+
+```
+
+## Data cleaning for liver
+
+```{r, warning=F, message=F}
+
+#joining into one data frame
+liv_min_lel2 <- subset(lelliver2,dsstox_substance_id %in% liv_dose_aed$dsstox_substance_id )
+liv_mins <- full_join(liv_min_lel2, liv_dose_aed, by="dsstox_substance_id")
+
+#subtracting the logs
+liv_mins$difference <- liv_mins$min_lel-log10(liv_mins$aed.meanac50.hu.css.50) # difference is the min_lel approx - mean AED
+liv_mins$difference.mins <- liv_mins$min_lel -log10(liv_mins$aed.p5ac50.hu.css.50) # difference.mins is the min lel approx - 5pAED
+#how many substances have both aed and lel for liver
+#nrow(liv_means) #364
+
+#making sure that the comparisons are telling us what we want
+liv_mins$compare <- liv_mins$min_lel>liv_mins$aed.meanac50.hu.css.50
+liv_mins$sign <- liv_mins$difference>0
+
+```
+
+## Data cleaning for kidney
+
+```{r, warning=F, message=F}
+
+#repeating above for kidney
+
+kid_min_lel<-subset(lelkidney2,dsstox_substance_id %in% kid_dose_aed$dsstox_substance_id )
+kid_mins<-full_join(kid_min_lel, kid_dose_aed, by="dsstox_substance_id")
+
+kid_mins$difference <- kid_mins$min_lel-log10(kid_mins$aed.meanac50.hu.css.50)
+kid_mins$difference.mins <- kid_mins$min_lel -log10(kid_mins$aed.p5ac50.hu.css.50)
+#nrow(kid_means) #134
+```
+
+## Sample sizes
+
+```{r, warning=F, message=F}
+ss_al<-data.frame(c(uniqueN(liv_mins$dsstox_substance_id),uniqueN(kid_mins$dsstox_substance_id)))
+colnames(ss_al)<-"Sample Size"
+ss_al$Organ<-c("Liver","Kidney")
+ss_al[,c(2,1)]
+
+```
+
+## Plotting log10 values difference
+
+```{r, warning=F, message=F, fig.height=12, fig.width=12}
+#liver lel-aed differences 1 histogram
+d1<-ggplot() +
+  geom_histogram(aes(difference), alpha = .8,bins=40, data = liv_mins) +
+  labs(x="min LEL-mean AED50, log10-mg/kg/day", y="# Substances", title="A Liver")+theme_bw(base_size = 14)+ scale_fill_viridis_d()+ylim(0,17)+xlim(-5,6)
+
+#kidney lel-aed differences 1 histogram
+d2<-ggplot() +
+  geom_histogram(aes(difference), alpha = .8,bins=40, data = kid_mins) +
+  labs(x="min LEL-mean AED50, log10-mg/kg/day", y="# Substances", title="E Kidney")+theme_bw(base_size=14)+ scale_fill_viridis_d()+ylim(0,17)+xlim(-5,6)
+
+# liver min lel approximation - 5th percentile AED approximation
+d3<-ggplot()+
+  geom_histogram(aes(difference.mins), alpha=.8, bins=40, data=liv_mins)+
+  labs(x="min LEL-5th%ile AED50, log10-mg/kg/day", y="# Substances", title="C Liver")+theme_bw(base_size=14)+ scale_fill_viridis_d()+ylim(0,17)+xlim(-5,6)
+
+
+# kidney min lel approximation - 5th percentile AED approximation
+d4<-ggplot()+
+  geom_histogram(aes(difference.mins), alpha=.8, bins=40, data=kid_mins)+
+  labs(x="min LEL-5th%ile AED50, log10-mg/kg/day", y="# Substances", title="G Kidney")+theme_bw(base_size=14)+ scale_fill_viridis_d()+ylim(0,17)+xlim(-5,6)
+
+
+differences <- plot_grid(d1,d2,d3,d4, nrow=2, ncol=2)
+differences
+```
+
+# Randomization testing for LEL vs AED {.tabset .tabset-fade .tabset-pills}  
+
+## P-values and confidence intervals
+```{r, warning=F, message=F}
+#function that generates p-values and confidence intervals using randomization tests for log10 differences of lel and aed data.
+rand_matched_p<-function(data, reps, seed){
+  #setting seed
+  set.seed(seed)
+  #mean of sample data
+xbar<-mean(data)
+#setting number of replications
+resamples<-reps
+#creating a dataset to store the null data
+nulldist<-rep(12345, resamples)
+#size of original data
+n<-length(data)
+
+#running the resampling, basically switching the signs on the original data mixes up the group labeling creating however many number of null distributions of size n we choose, then taking the mean of those
+for(i in 1:resamples){
+     signs <- sample(c(1,-1),size = n, replace = TRUE)
+    simdiffs<- signs*data
+    nulldist[i] <- mean(simdiffs)
+}
+
+#data frame of null means
+nulldist<-data.frame(nulldist)
+#how many times is the null mean as or more extreme than the observed mean?
+lowtail<-(sum(nulldist <= xbar)+1)
+uptail<-(sum(nulldist >= xbar)+1)
+
+#taking the minumum, two sided test
+num<-min(lowtail,uptail)
+#total number of chances
+denom<-resamples+1
+#p-value multipled by two because its a two sided test
+p<- (2 * (num/denom))
+#standard error
+se<-sd(nulldist$nulldist)
+#upper confidence bound
+upci<-xbar+(qnorm(.975)*se)
+#lower confidence bound
+lowci<-xbar-(qnorm(.975)*se)
+#the outcomes
+outy<-data.frame(p,xbar,upci,lowci)
+colnames(outy)<-c("P-value","Mean","Upper CI","Lower CI")
+outy
+}
+
+#running for liver and kidney, 100000 replications each
+livp_mean_aed_diff <-rand_matched_p(liv_mins$difference, 100000, 123)
+kidp_mean_aed_diff <-rand_matched_p(kid_mins$difference, 100000, 123)
+livp_p5_aed_diff <-rand_matched_p(liv_mins$difference.mins, 100000, 123)
+kidp_p5_aed_diff <-rand_matched_p(kid_mins$difference.mins, 100000, 123)
+
+comp<-round(data.frame(rbind(livp_mean_aed_diff,
+                             livp_p5_aed_diff, 
+                             kidp_mean_aed_diff, 
+                             kidp_p5_aed_diff)),4)
+comp$Organ<-c("Liver, Mean AED","Liver, p5 AED", "Kidney, Mean AED", "Kidney, p5 AED")
+comp[,c(5,2,3,4,1)]
+#write.csv(comp, file='./output/Table3_liv_kid_AED_LEL_diffs_pvals_7Feb2023.csv')
+```
+
+## Randomization plots
+```{r, warning=F, message=F}
+#exactly the same method as above just a different outcome, instead of outputting the p-value a plot is output
+rand_matched_plot<-function(data, reps, seed){
+  set.seed(seed)
+xbar<-mean(data)
+resamples<-reps
+nulldist<-rep(12345, resamples)
+n<-length(data)
+
+for(i in 1:resamples){
+     signs <- sample(c(1,-1),size = n, replace = TRUE)
+    simdiffs<- signs*data
+    nulldist[i] <- mean(simdiffs)
+}
+
+#the distribution of means is plotted as a density plot
+nulldist<-data.frame(nulldist)
+
+se<-sd(nulldist$nulldist)
+upci<-xbar+(qnorm(.975)*se)
+lowci<-xbar-(qnorm(.975)*se)
+
+#the red vline is the observed mean, the dashed lines are the upper and lower bounds on the confidence interval, a visual representation of the p-value.
+ggplot(nulldist, aes(x=nulldist))+geom_density()+geom_vline(xintercept = xbar, color="red")+geom_vline(xintercept = upci, color="red", linetype="dashed")+geom_vline(xintercept = lowci, color="red", linetype="dashed")+theme_bw(base_size = 14)+labs(y="", x="")+theme(axis.text = element_text(size=12))
+
+}
+
+rp1<-rand_matched_plot(liv_mins$difference, 100000, 123)
+rp2<-rand_matched_plot(kid_mins$difference, 100000, 123)
+#rp1<-rp1+labs(title='C Liver', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.1,1.1)
+#rp2<-rp2+labs(title='F Kidney', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.1,1.1)
+
+## modified functon to add ggplots in blue for p5 AED
+
+rand_matched_plot<-function(data, reps, seed){
+  set.seed(seed)
+xbar<-mean(data)
+resamples<-reps
+nulldist<-rep(12345, resamples)
+n<-length(data)
+
+for(i in 1:resamples){
+     signs <- sample(c(1,-1),size = n, replace = TRUE)
+    simdiffs<- signs*data
+    nulldist[i] <- mean(simdiffs)
+}
+
+#the distribution of means is plotted as a density plot
+nulldist<-data.frame(nulldist)
+
+se<-sd(nulldist$nulldist)
+upci<-xbar+(qnorm(.975)*se)
+lowci<-xbar-(qnorm(.975)*se)
+
+#the red vline is the observed mean, the dashed lines are the upper and lower bounds on the confidence interval, a visual representation of the p-value.
+ggplot(nulldist, aes(x=nulldist))+geom_density()+geom_vline(xintercept = xbar, color="blue")+geom_vline(xintercept = upci, color="blue", linetype="dashed")+geom_vline(xintercept = lowci, color="blue", linetype="dashed")+theme_bw(base_size = 14)+labs(y="", x="")+theme(axis.text = element_text(size=12))
+
+}
+
+rp3<-rand_matched_plot(liv_mins$difference.mins, 100000, 123)
+rp4<-rand_matched_plot(kid_mins$difference.mins, 100000, 123)
+rp3<-rp3+labs(title='D Liver', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-0.5,1.6)
+rp4<-rp4+labs(title='H Kidney', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.0,1.2)
+
+rp5<-rp1+labs(title='B Liver', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.1,1.1)
+rp6<-rp2+labs(title='F Kidney', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.1,1.1)
+
+```
+
+```{r, warning=FALSE, messages=FALSE, fig.width=9, fig.height=18}
+
+lel.aed.all <- plot_grid(d1,rp5,
+                         d3,rp3,
+                         d2,rp6,
+                         d4,rp4,
+                        nrow=4,
+                         ncol=2,
+                        align='hv')
+
+
+
+lel.aed.all
+
+```
+
+```{r, warning=F, eval=F, echo=F}
+
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig6_LEL_AED_comp_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=6000, height=8000, res=600)
+lel.aed.all
+dev.off()
+
+```
+
+
+```{r gut-check-httk-v2-2-2, warning=FALSE, include=FALSE}
+
+load('./output/aed_from_hu_httk_3css_27Dec2022.RData')
+old.aed <- as.data.table(aed.hu.css.dt)
+length(old.aed$dsstox_substance_id)
+
+load('./output/aed_from_hu_httk_3css_4Feb2022.RData')
+new.aed <- unique(as.data.table(aed.hu.css.dt))
+length(new.aed$dsstox_substance_id)
+new.aed <- new.aed[dsstox_substance_id %in% old.aed[,dsstox_substance_id]]
+
+setdiff(new.aed$dsstox_substance_id, old.aed$dsstox_substance_id)
+
+kidney.comp.aed <-new.aed[organ=='kidney' & dsstox_substance_id %in% old.aed$dsstox_substance_id]
+kidney.comp.aed$oldp5 <- old.aed[organ=='kidney']$p5.ac50uM[match(kidney.comp.aed$dsstox_substance_id, old.aed[organ=='kidney']$dsstox_substance_id)]
+kidney.comp.aed <- kidney.comp.aed[!is.na(oldp5)]
+
+kidney.comp.aed$oldp5aed <- old.aed[organ=='kidney']$aed.p5ac50.hu.css.50[match(kidney.comp.aed$dsstox_substance_id, old.aed[organ=='kidney']$dsstox_substance_id)]
+
+plot(log10(kidney.comp.aed$oldp5aed), log10(kidney.comp.aed$aed.p5ac50.hu.css.50))
+
+```
+
+```{r httk-2-2-2-aed-kidney, include=FALSE}
+kid.aed.comp <- ggplot(data=kidney.comp.aed, 
+                       aes(x=oldp5aed, y=aed.p5ac50.hu.css.50))+
+  geom_point()+
+  theme_bw()+
+  theme(axis.text = element_text(size=14),
+        axis.title = element_text(size=16),
+        title = element_text(size=18, face='bold'))+
+  scale_y_log10()+
+  scale_x_log10()+
+  geom_abline(slope=1, intercept=0)+
+  geom_abline(slope=1, intercept=1, linetype='dashed')+
+  geom_abline(slope=1, intercept=-1, linetype='dashed')+
+  geom_smooth(method='lm',se=FALSE,color='blue',formula=y~x)+
+  stat_poly_eq(formula=y ~x,
+               eq.with.lhs = "italic(hat(y))~`=`~",
+               aes(label=paste(..eq.label.., ..rr.label.., sep ="~~~")),
+               parse=TRUE)+
+  ggtitle('Kidney AEDs')
+  #xlab(')+
+  #ylab('BMD for tg_effect_id, log10-mg/kg/day')+
+
+
+```
+```{r httk-2-2-2-aed-kidney-plot, include=FALSE}
+
+liver.comp.aed <-new.aed[organ=='liver' & dsstox_substance_id %in% old.aed$dsstox_substance_id]
+liver.comp.aed$oldp5 <- old.aed[organ=='liver']$p5.ac50uM[match(liver.comp.aed$dsstox_substance_id, old.aed[organ=='liver']$dsstox_substance_id)]
+liver.comp.aed <- liver.comp.aed[!is.na(oldp5)]
+
+liver.comp.aed$oldp5aed <- old.aed[organ=='liver']$aed.p5ac50.hu.css.50[match(liver.comp.aed$dsstox_substance_id, old.aed[organ=='liver']$dsstox_substance_id)]
+
+liv.aed.comp <- ggplot(data=liver.comp.aed, 
+                       aes(x=oldp5aed, y=aed.p5ac50.hu.css.50))+
+  geom_point()+
+  theme_bw()+
+  theme(axis.text = element_text(size=14),
+        axis.title = element_text(size=16),
+        title = element_text(size=18, face='bold'))+
+  scale_y_log10()+
+  scale_x_log10()+
+  geom_abline(slope=1, intercept=0)+
+  geom_abline(slope=1, intercept=1, linetype='dashed')+
+  geom_abline(slope=1, intercept=-1, linetype='dashed')+
+  geom_smooth(method='lm',se=FALSE,color='blue',formula=y~x)+
+  stat_poly_eq(formula=y ~x,
+               eq.with.lhs = "italic(hat(y))~`=`~",
+               aes(label=paste(..eq.label.., ..rr.label.., sep ="~~~")),
+               parse=TRUE)+
+  ggtitle('Liver AEDs')
+  #xlab(')+
+  #ylab('BMD for tg_effect_id, log10-mg/kg/day')+
+
+```
+
+
+```{r liv-kid-httk2-2-2-gutcheck-plots, include=FALSE, fig.width=12, fig.height=6, include=FALSE}
+
+
+plot_grid(kid.aed.comp,liv.aed.comp)
+
+
+```
+
+# Part D: HED vs AED, Data Cleaning {.tabset .tabset-fade .tabset-pills}  
+
+## Allometric scaling of LELs
+
+* per Nair and Jacobs, 2016, Table 1
+* for rat, dog, and mouse LEL values in liver and kidney
+
+```{r allometric-scaling, warning=FALSE, message=FALSE}
+#unique(liver2$species) # [1] "rat"   "dog"   "mouse"
+# allometric scaling factors per Table 1 of Nair and Jacobs, 2016:
+liver2[species == 'rat', hed_dose_adjusted := dose_adjusted*0.162]
+liver2[species == 'mouse', hed_dose_adjusted := dose_adjusted*0.135]
+liver2[species == 'dog', hed_dose_adjusted := dose_adjusted*0.541]
+
+kidney[species == 'rat', hed_dose_adjusted := dose_adjusted*0.162]
+kidney[species == 'mouse', hed_dose_adjusted := dose_adjusted*0.135]
+kidney[species == 'dog', hed_dose_adjusted := dose_adjusted*0.541]
+```
+
+* Redo the summarization of the LELs for comparison to AEDs
+* Compute min of hed_dose_adjusted as min LEL per dtxsid for SUB and CHR data
+
+```{r, warning=FALSE, message=FALSE}
+
+lelliver3<-liver2 %>% 
+  group_by(dsstox_substance_id) %>% 
+  summarise(hed.min=min(log10(hed_dose_adjusted)),
+            hed.mean=mean(log10(hed_dose_adjusted)))
+
+lelkidney3<-kidney %>% 
+  group_by(dsstox_substance_id) %>% 
+  summarise(hed.min=min(log10(hed_dose_adjusted)),
+            hed.mean=mean(log10(hed_dose_adjusted)))
+
+```
+
+## Data cleaning
+
+* Join HED and AED into one dataframe
+* Calculate min HED to mean AED and min HED to 5p AED (min) differences on log10-mg/kg/day basis
+* Liver here in first chunk
+
+```{r data-clean-aed-hed-liv, warning=F, message=F}
+#joining into one data frame
+liv_hed <- subset(lelliver3,dsstox_substance_id %in% liv_dose_aed$dsstox_substance_id)
+liv_hed_aed <-full_join(liv_hed, liv_dose_aed, by="dsstox_substance_id")
+
+#subtracting the logs
+liv_hed_aed$difference <- liv_hed_aed$hed.min-log10(liv_hed_aed$aed.meanac50.hu.css.50)
+liv_hed_aed$difference.mins <- liv_hed_aed$hed.min -log10(liv_hed_aed$aed.p5ac50.hu.css.50)
+
+#how many substances have both aed and lel for liver
+#nrow(liv_hed_aed) #365
+
+#making sure that the comparisons are telling us what we want
+liv_hed_aed$compare <- liv_hed_aed$hed.min > liv_hed_aed$aed.meanac50.hu.css.50
+liv_hed_aed$sign <- liv_hed_aed$difference > 0
+
+#negative means that aed is greater than lel, positive means aed is less than lel.
+```
+
+* Repeat for kidney
+
+```{r data-clean-aed-hed-kid, warning=F, message=F}
+
+# repeating above for kidney
+kid_hed <- subset(lelkidney3,dsstox_substance_id %in% kid_dose_aed$dsstox_substance_id)
+kid_hed_aed <-full_join(kid_hed, kid_dose_aed, by="dsstox_substance_id")
+
+#subtracting the logs
+kid_hed_aed$difference <- kid_hed_aed$hed.min-log10(kid_hed_aed$aed.meanac50.hu.css.50)
+kid_hed_aed$difference.mins <- kid_hed_aed$hed.min -log10(kid_hed_aed$aed.p5ac50.hu.css.50)
+
+#how many substances have both aed and lel for kidney
+#nrow(kid_hed_aed) #194
+
+#making sure that the comparisons are telling us what we want
+kid_hed_aed$compare <- kid_hed_aed$hed.min > kid_hed_aed$aed.meanac50.hu.css.50
+kid_hed_aed$sign <- kid_hed_aed$difference > 0
+
+```
+
+## HED sample sizes
+
+```{r, warning=F, message=F}
+ss_al<-data.frame(c(uniqueN(liv_hed_aed$dsstox_substance_id),uniqueN(kid_hed_aed$dsstox_substance_id)))
+colnames(ss_al)<-"Sample Size"
+ss_al$Organ<-c("Liver","Kidney")
+ss_al[,c(2,1)]
+
+```
+
+## Plotting mean log10 values difference
+
+```{r, warning=F, message=F, fig.height=12, fig.width=12}
+#liver min hed -aed differences 1 histogram
+d1<-ggplot() +
+  geom_histogram(aes(difference), alpha = .8,bins=40, data = liv_hed_aed) +
+  labs(x="min HED-mean AED50, log10-mg/kg/day", y="# Substances", title="A Liver")+theme_bw(base_size = 14)+ scale_fill_viridis_d()+ylim(0,17)+xlim(-5,6)
+
+#kidney min hed-aed differences 1 histogram
+d2<-ggplot() +
+  geom_histogram(aes(difference), alpha = .8,bins=40, data = kid_hed_aed) +
+  labs(x="min HED-mean AED50, log10-mg/kg/day", y="", title="E Kidney")+theme_bw(base_size=14)+ scale_fill_viridis_d()+ylim(0,17)+xlim(-5,6)
+
+# liver min hed approximation - 5th percentile AED approximation
+d3<-ggplot()+
+  geom_histogram(aes(difference.mins), alpha=.8, bins=40, data=liv_hed_aed)+
+  labs(x="min HED-5th%ile AED50, log10-mg/kg/day", y="# Substances", title="C Liver")+theme_bw(base_size=14)+ scale_fill_viridis_d()+ylim(0,17)+xlim(-5,6)
+
+
+# kidney min hed approximation - 5th percentile AED approximation
+d4<-ggplot()+
+  geom_histogram(aes(difference.mins), alpha=.8, bins=40, data=kid_hed_aed)+
+  labs(x="min HED-5th%ile AED50, log10-mg/kg/day", y="", title="G Kidney")+theme_bw(base_size=14)+ scale_fill_viridis_d()+ylim(0,17)+xlim(-5,6)
+
+
+differences <- plot_grid(d1,d2,d3,d4, nrow=2, ncol=2)
+differences
+```
+
+# Part D: Randomization testing for HED vs AED {.tabset .tabset-fade .tabset-pills}  
+
+## P-values and confidence intervals
+```{r, warning=F, message=F}
+#function that generates p-values and confidence intervals using randomization tests for log10 differences of lel and aed data.
+rand_matched_p<-function(data, reps, seed){
+  #setting seed
+  set.seed(seed)
+  #mean of sample data
+xbar<-mean(data)
+#setting number of replications
+resamples<-reps
+#creating a dataset to store the null data
+nulldist<-rep(12345, resamples)
+#size of original data
+n<-length(data)
+
+#running the resampling, basically switching the signs on the original data mixes up the group labeling creating however many number of null distributions of size n we choose, then taking the mean of those
+for(i in 1:resamples){
+     signs <- sample(c(1,-1),size = n, replace = TRUE)
+    simdiffs<- signs*data
+    nulldist[i] <- mean(simdiffs)
+}
+
+#data frame of null means
+nulldist<-data.frame(nulldist)
+#how many times is the null mean as or more extreme than the observed mean?
+lowtail<-(sum(nulldist <= xbar)+1)
+uptail<-(sum(nulldist >= xbar)+1)
+
+#taking the minumum, two sided test
+num<-min(lowtail,uptail)
+#total number of chances
+denom<-resamples+1
+#p-value multipled by two because its a two sided test
+p<- (2 * (num/denom))
+#standard error
+se<-sd(nulldist$nulldist)
+#upper confidence bound
+upci<-xbar+(qnorm(.975)*se)
+#lower confidence bound
+lowci<-xbar-(qnorm(.975)*se)
+#the outcomes
+outy<-data.frame(p,xbar,upci,lowci)
+colnames(outy)<-c("P-value","Mean","Upper CI","Lower CI")
+outy
+}
+
+#running for liver and kidney, 100000 replications each
+livphed <- rand_matched_p(liv_hed_aed$difference, 100000, 123)
+kidphed <- rand_matched_p(kid_hed_aed$difference, 100000, 123)
+livphed5p <- rand_matched_p(liv_hed_aed$difference.mins, 100000, 123)
+kidphed5p <- rand_matched_p(kid_hed_aed$difference.mins, 100000, 123)
+
+
+comp.hed <-round(data.frame(rbind(livphed,livphed5p, kidphed, kidphed5p)),4)
+comp.hed$Organ<-c("Liver HED, Mean AED","Liver HED, p5 AED", "Kidney HED, Mean AED", "Kidney HED, p5 AED")
+comp.hed[,c(5,2,3,4,1)]
+#write.csv(comp, file='./output/Table3b_liv_kid_AEDHED_diffs_pvals_6Feb2023.csv')
+```
+
+## Randomization plots
+```{r, warning=F, message=F}
+#exactly the same method as above just a different outcome, instead of outputting the p-value a plot is output
+rand_matched_plot<-function(data, reps, seed){
+  set.seed(seed)
+xbar<-mean(data)
+resamples<-reps
+nulldist<-rep(12345, resamples)
+n<-length(data)
+
+for(i in 1:resamples){
+     signs <- sample(c(1,-1),size = n, replace = TRUE)
+    simdiffs<- signs*data
+    nulldist[i] <- mean(simdiffs)
+}
+
+#the distribution of means is plotted as a density plot
+nulldist<-data.frame(nulldist)
+
+se<-sd(nulldist$nulldist)
+upci<-xbar+(qnorm(.975)*se)
+lowci<-xbar-(qnorm(.975)*se)
+
+#the red vline is the observed mean, the dashed lines are the upper and lower bounds on the confidence interval, a visual representation of the p-value.
+ggplot(nulldist, aes(x=nulldist))+geom_density()+geom_vline(xintercept = xbar, color="red")+geom_vline(xintercept = upci, color="red", linetype="dashed")+geom_vline(xintercept = lowci, color="red", linetype="dashed")+theme_bw(base_size = 14)+labs(y="", x="")+theme(axis.text = element_text(size=12))
+
+}
+
+hed1 <- rand_matched_plot(liv_hed_aed$difference, 100000, 123)
+hed2 <- rand_matched_plot(kid_hed_aed$difference, 100000, 123)
+
+#exactly the same method as above just a different outcome, instead of outputting the p-value a plot is output
+rand_matched_plot<-function(data, reps, seed){
+  set.seed(seed)
+xbar<-mean(data)
+resamples<-reps
+nulldist<-rep(12345, resamples)
+n<-length(data)
+
+for(i in 1:resamples){
+     signs <- sample(c(1,-1),size = n, replace = TRUE)
+    simdiffs<- signs*data
+    nulldist[i] <- mean(simdiffs)
+}
+
+#the distribution of means is plotted as a density plot
+nulldist<-data.frame(nulldist)
+
+se<-sd(nulldist$nulldist)
+upci<-xbar+(qnorm(.975)*se)
+lowci<-xbar-(qnorm(.975)*se)
+
+#the red vline is the observed mean, the dashed lines are the upper and lower bounds on the confidence interval, a visual representation of the p-value.
+ggplot(nulldist, aes(x=nulldist))+geom_density()+geom_vline(xintercept = xbar, color="blue")+geom_vline(xintercept = upci, color="blue", linetype="dashed")+geom_vline(xintercept = lowci, color="blue", linetype="dashed")+theme_bw(base_size = 14)+labs(y="", x="")+theme(axis.text = element_text(size=12))
+
+}
+
+hed3 <- rand_matched_plot(liv_hed_aed$difference.mins, 100000, 123)
+hed4 <- rand_matched_plot(kid_hed_aed$difference.mins, 100000, 123)
+hed1 <- hed1+labs(title='B Liver', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.1,1.1)
+hed2 <- hed2+labs(title='F Kidney', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.1,1.1)
+hed3 <- hed3+labs(title='D Liver', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.1,1.1)
+hed4 <- hed4+labs(title='H Kidney', x='Null Mean Differences, log10-mg/kg/day', y='Density')+ylim(0,4.5)+xlim(-1.1,1.1)
+
+```
+
+```{r, warning=FALSE, messages=FALSE, fig.width=9, fig.height=18}
+
+hed.aed.all <- plot_grid(d1,hed1,
+                         d3,hed3,
+                         d2,hed2,
+                         d4,hed4,
+                        nrow=4,
+                         ncol=2,
+                        align='hv')
+
+hed.aed.all
+
+```
+```{r fig7-hed-v-aed, warning=FALSE, message=FALSE, eval=FALSE}
+file.dir <- paste('output/', sep='')
+file.name <- paste('/Fig7_HED_AED_comp_', Sys.Date(), '.png', sep='')
+file.path <- paste(file.dir, file.name, sep='')
+dir.create(path=file.dir, showWarnings = FALSE, recursive = TRUE)
+png(file.path, width=6000, height=8000, res=600)
+hed.aed.all
+dev.off()
+
+```
+```
+
+```{r, warning=FALSE, eval=FALSE}
+
+# create Supp File 5
+
+Suppfile5 <- list("mc5 summary" = mc5.df,
+                     "kidney assays used" = as.data.frame(kidney.aeid),
+                     "liver assays used" = as.data.frame(liver.aeid),
+                  "liver AED and LEL" = as.data.frame(liv_mins),
+                  "kidney AED and LEL" = as.data.frame(kid_mins),
+                  "AED to LEL results" = as.data.frame(comp),
+                  "liver AED and HED" = as.data.frame(liv_hed_aed),
+                  "kidney AED and HED" = as.data.frame(kid_hed_aed),
+                  "AED to HED results" = as.data.frame(comp.hed))
+
+write.xlsx(Suppfile5, file='./output/Supp File 5_AED_LEL_HED_comparisons 7Apr2023.xlsx')
+
+
+
+```
+
+# Reproducibility
+
+```{r, warning=FALSE, message=FALSE}
+
+print(sessionInfo())
+```
+
